@@ -1,0 +1,33 @@
+"""Structural tokenizer protocol used by model-independent components."""
+
+from __future__ import annotations
+
+from typing import Any, Protocol
+
+
+class OriginalTokenizer(Protocol):
+    """Minimum original-tokenizer interface required by VocabCraft."""
+
+    def __len__(self) -> int: ...
+
+    @property
+    def all_special_ids(self) -> list[int]: ...
+
+    @property
+    def all_special_tokens(self) -> list[str]: ...
+
+    @property
+    def pad_token_id(self) -> int | None: ...
+
+    @property
+    def unk_token_id(self) -> int | None: ...
+
+    def convert_ids_to_tokens(self, ids: int | list[int]) -> str | list[str]: ...
+
+    def convert_tokens_to_ids(self, tokens: str | list[str]) -> int | list[int]: ...
+
+    def encode(self, text: str, *, add_special_tokens: bool = True) -> list[int]: ...
+
+    def decode(self, token_ids: list[int], **kwargs: Any) -> str: ...
+
+    def __call__(self, text: str | list[str], **kwargs: Any) -> dict[str, Any]: ...

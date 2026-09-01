@@ -39,6 +39,7 @@ dev = [
   "pytest-cov>=5.0",
   "ruff>=0.5",
   "types-PyYAML>=6.0",
+  "types-regex>=2024.5.15",
 ]
 
 [project.scripts]
@@ -65,4 +66,3 @@ exclude = ["tests"]
 addopts = "-ra"
 testpaths = ["tests"]
 markers = ["integration: downloads and exercises a real model"]
-
