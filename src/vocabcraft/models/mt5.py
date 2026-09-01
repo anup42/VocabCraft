@@ -15,10 +15,16 @@ import transformers
 from transformers import AutoTokenizer, MT5EncoderModel, MT5ForConditionalGeneration
 
 from vocabcraft.artifacts import atomic_output_directory, write_json
-from vocabcraft.exceptions import InspectionError, UnsupportedModelError, ValidationFailure
+from vocabcraft.exceptions import (
+    InspectionError,
+    UnsupportedModeError,
+    UnsupportedModelError,
+    ValidationFailure,
+)
 from vocabcraft.hashing import sha256_bytes, sha256_json
 from vocabcraft.mappings import IdMapping, remap_token_id_fields
 from vocabcraft.models.base import ModelAdapter
+from vocabcraft.selection import SelectionResult
 
 _GENERATION_ID_FIELDS = (
     "pad_token_id",
@@ -149,6 +155,8 @@ class MT5Adapter(ModelAdapter):
         self.model = model
         self.tokenizer = tokenizer
         self.identifier = identifier
+        self._model_state_hash: str | None = None
+        self._tokenizer_hash: str | None = None
         self.model.eval()
         self.validate_structure()
 
@@ -312,10 +320,24 @@ class MT5Adapter(ModelAdapter):
             "vocabulary_dependent_parameter_count": vocabulary_parameters,
             "non_vocabulary_parameter_count": total_parameters - vocabulary_parameters,
             "estimated_state_bytes_by_dtype": dict(sorted(dtype_bytes.items())),
-            "model_state_sha256": _hash_state_dict(state),
-            "tokenizer_sha256": _tokenizer_hash(self.tokenizer),
+            "model_state_sha256": self.model_state_hash(),
+            "tokenizer_sha256": self.tokenizer_hash(),
             "tokenizer_model_vocab_size_mismatch": len(self.tokenizer) != self.model_vocab_size,
         }
+
+    def model_state_hash(self) -> str:
+        """Return and cache the exact source state hash for this loaded adapter."""
+
+        if self._model_state_hash is None:
+            self._model_state_hash = _hash_state_dict(self.model.state_dict())
+        return self._model_state_hash
+
+    def tokenizer_hash(self) -> str:
+        """Return and cache the exact serialized tokenizer/model hash."""
+
+        if self._tokenizer_hash is None:
+            self._tokenizer_hash = _tokenizer_hash(self.tokenizer)
+        return self._tokenizer_hash
 
     def _compact_state_dict(
         self, target_state: dict[str, torch.Tensor], mapping: IdMapping
@@ -359,6 +381,12 @@ class MT5Adapter(ModelAdapter):
     ) -> dict[str, Any]:
         tokenizer_dir = staging / "tokenizer"
         self.tokenizer.save_pretrained(tokenizer_dir)
+        write_json(staging / "source-config.json", self.model.config.to_dict())
+        if getattr(self.model, "generation_config", None) is not None:
+            write_json(
+                staging / "source-generation-config.json",
+                self.model.generation_config.to_dict(),
+            )
         mapping_payload = mapping.to_dict()
         write_json(staging / "mapping-report.json", mapping_payload)
         metadata = {
@@ -368,8 +396,8 @@ class MT5Adapter(ModelAdapter):
             "profile_id": profile_id,
             "source_model": self.identifier,
             "source_revision": getattr(self.model.config, "_commit_hash", None),
-            "model_state_sha256": _hash_state_dict(self.model.state_dict()),
-            "tokenizer_sha256": _tokenizer_hash(self.tokenizer),
+            "model_state_sha256": self.model_state_hash(),
+            "tokenizer_sha256": self.tokenizer_hash(),
             "original_model_vocabulary_size": mapping.original_vocab_size,
             "original_tokenizer_vocabulary_size": len(self.tokenizer),
             "compact_vocabulary_size": len(mapping.new_to_old),
@@ -379,7 +407,11 @@ class MT5Adapter(ModelAdapter):
         return metadata
 
     def build_encoder_profile(
-        self, mapping: IdMapping, output: Path, profile_id: str = "unspecified"
+        self,
+        mapping: IdMapping,
+        output: Path,
+        profile_id: str = "unspecified",
+        selection: SelectionResult | None = None,
     ) -> dict[str, Any]:
         """Build an encoder-only artifact with exact copied retained rows."""
 
@@ -394,6 +426,10 @@ class MT5Adapter(ModelAdapter):
             model_dir = staging / "model"
             compact.save_pretrained(model_dir, safe_serialization=True)
             metadata = self._write_common_artifacts(staging, mapping, "encoder_exact", profile_id)
+            if selection is not None:
+                from vocabcraft.manifests import write_selection_artifacts
+
+                write_selection_artifacts(staging, selection, profile_id)
             reloaded = MT5EncoderModel.from_pretrained(model_dir).eval()
             retained = torch.tensor(mapping.new_to_old, dtype=torch.long)
             expected = self.model.shared.weight.detach().index_select(0, retained)
@@ -407,7 +443,11 @@ class MT5Adapter(ModelAdapter):
         return metadata
 
     def build_seq2seq_profile(
-        self, mapping: IdMapping, output: Path, profile_id: str = "unspecified"
+        self,
+        mapping: IdMapping,
+        output: Path,
+        profile_id: str = "unspecified",
+        selection: SelectionResult | None = None,
     ) -> dict[str, Any]:
         """Build an experimental fully compact mT5 encoder-decoder artifact."""
 
@@ -427,6 +467,10 @@ class MT5Adapter(ModelAdapter):
             model_dir = staging / "model"
             compact.save_pretrained(model_dir, safe_serialization=True)
             metadata = self._write_common_artifacts(staging, mapping, "seq2seq_compact", profile_id)
+            if selection is not None:
+                from vocabcraft.manifests import write_selection_artifacts
+
+                write_selection_artifacts(staging, selection, profile_id)
             reloaded = MT5ForConditionalGeneration.from_pretrained(model_dir).eval()
             retained = torch.tensor(mapping.new_to_old, dtype=torch.long)
             expected = self.model.shared.weight.detach().index_select(0, retained)
@@ -445,5 +489,76 @@ class MT5Adapter(ModelAdapter):
                     ),
                 }
             )
+            write_json(staging / "vocabcraft-metadata.json", metadata)
+        return metadata
+
+    def build_guarded_profile(
+        self,
+        mapping: IdMapping,
+        output: Path,
+        profile_id: str = "unspecified",
+        selection: SelectionResult | None = None,
+    ) -> dict[str, Any]:
+        """Build a greedy-only guarded artifact when the output head is truly untied."""
+
+        tying = self.detect_weight_tying()
+        if tying["shared_output_same_storage"] or tying["config_tie_word_embeddings"]:
+            raise UnsupportedModeError(
+                "seq2seq_guarded is unsafe for this checkpoint because the full output "
+                "projection is tied to the compact shared embedding"
+            )
+        if mapping.original_vocab_size != self.model_vocab_size:
+            raise ValidationFailure("mapping original size does not match model vocabulary size")
+        source_output = self.model.get_output_embeddings()
+        if source_output is None or not isinstance(source_output, torch.nn.Linear):
+            raise UnsupportedModeError("guarded mode requires an untied linear output head")
+        config = self._compact_config(mapping)
+        config.tie_word_embeddings = False
+        compact = MT5ForConditionalGeneration(config)
+        compact.lm_head = torch.nn.Linear(
+            source_output.in_features,
+            self.model_vocab_size,
+            bias=source_output.bias is not None,
+        )
+        compact_state = self._compact_state_dict(compact.state_dict(), mapping)
+        compact.load_state_dict(compact_state, strict=True)
+        compact.eval()
+        with atomic_output_directory(output) as staging:
+            model_dir = staging / "model"
+            compact.save_pretrained(model_dir, safe_serialization=True)
+            metadata = self._write_common_artifacts(staging, mapping, "seq2seq_guarded", profile_id)
+            if selection is not None:
+                from vocabcraft.manifests import write_selection_artifacts
+
+                write_selection_artifacts(staging, selection, profile_id)
+            decoder_start = getattr(self.model.config, "decoder_start_token_id", None)
+            eos = getattr(self.model.config, "eos_token_id", None)
+            if not isinstance(decoder_start, int) or not isinstance(eos, int):
+                raise UnsupportedModeError(
+                    "guarded mode requires scalar decoder_start_token_id and eos_token_id"
+                )
+            metadata.update(
+                {
+                    "experimental": True,
+                    "guarded_scope": {
+                        "do_sample": False,
+                        "num_beams": 1,
+                        "maximum_output_length_required": True,
+                    },
+                    "original_decoder_start_token_id": decoder_start,
+                    "original_eos_token_id": eos,
+                    "full_original_output_projection": True,
+                }
+            )
+            from vocabcraft.models.mt5_guarded_generation import load_guarded_mt5_model
+
+            reloaded = load_guarded_mt5_model(model_dir, self.model_vocab_size)
+            retained = torch.tensor(mapping.new_to_old, dtype=torch.long)
+            expected = self.model.shared.weight.detach().index_select(0, retained)
+            if not torch.equal(reloaded.shared.weight, expected):
+                raise ValidationFailure("reloaded guarded shared rows differ from source rows")
+            if not torch.equal(reloaded.lm_head.weight, source_output.weight):
+                raise ValidationFailure("reloaded guarded full output head differs from source")
+            metadata["reloaded_row_copy_exact"] = True
             write_json(staging / "vocabcraft-metadata.json", metadata)
         return metadata

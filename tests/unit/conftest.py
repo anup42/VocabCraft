@@ -62,6 +62,10 @@ class FakeTokenizer:
     def unk_token_id(self) -> int:
         return 2
 
+    @property
+    def eos_token_id(self) -> int:
+        return 1
+
     def convert_ids_to_tokens(self, ids: int | list[int]) -> str | list[str]:
         if isinstance(ids, int):
             return self.pieces[ids]
