@@ -9,5 +9,6 @@
 {"id":"enc-emoji-001","text":"Great!!! धन्यवाद 😊👍🏽 #done","language":"en-hi","domain":"chat","critical":false}
 {"id":"enc-noise-001","text":"pleeease opn teh app kal subh; कॉल शायद कट गइ","language":"en-hi","domain":"noisy-input","critical":false,"noise":["typing","asr","ocr"]}
 {"id":"enc-mixed-001","text":"दिल्लीMetro se Noida चलो","language":"en-hi","domain":"maps","critical":false}
+{"id":"enc-unsupported-001","text":"東京へ行きます","language":"ja","domain":"fallback-demo","critical":false,"expected":"fallback"}
 {"id":"seq-001","source":"Translate to Hindi: Where is my phone?","target":"मेरा फोन कहाँ है?","source_language":"en","target_language":"hi","task":"translation","domain":"assistant","critical":true}
 {"id":"seq-002","source":"हिंदी में उत्तर दें: Ravi is in Delhi.","target":"रवि दिल्ली में है।","source_language":"en-hi","target_language":"hi","task":"translation","domain":"assistant","critical":true}

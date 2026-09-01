@@ -476,8 +476,21 @@ def build_pack_to_directory(
     adapter = MT5Adapter.from_pretrained(model_identifier)
     _validate_source_hashes(adapter, metadata)
     excluded = sorted(set(range(mapping.original_vocab_size)) - set(mapping.new_to_old))
+    mode = metadata.get("vocabcraft_mode")
+    if mode == "encoder_exact":
+        source_model = MT5EncoderModel(adapter.model.config)
+        source_state = adapter.model.state_dict()
+        encoder_state = {
+            name: source_state[name].detach().clone() for name in source_model.state_dict()
+        }
+        source_model.load_state_dict(encoder_state, strict=True)
+        vocabulary_state = source_model.state_dict()
+    elif mode in {"seq2seq_compact", "seq2seq_guarded"}:
+        vocabulary_state = adapter.model.state_dict()
+    else:
+        raise ArtifactError(f"unsupported artifact mode for cold pack: {mode!r}")
     return build_cold_pack(
-        adapter.model.state_dict(),
+        vocabulary_state,
         excluded,
         mapping.original_vocab_size,
         output,

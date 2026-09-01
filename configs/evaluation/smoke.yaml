@@ -1,6 +1,5 @@
 evaluation:
-  data: ../../examples/calibration-en-hi.jsonl
+  data: ../../examples/smoke-en-hi.jsonl
   deterministic: true
   max_output_length: 32
   seed: 2026
-
