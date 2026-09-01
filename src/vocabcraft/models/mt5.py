@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import gc
 import hashlib
 import importlib.metadata
 from collections import defaultdict
@@ -398,6 +399,34 @@ class MT5Adapter(ModelAdapter):
         config.vocab_size = len(mapping.new_to_old)
         return config
 
+    def _new_compact_seq2seq_model(self, config: Any) -> MT5ForConditionalGeneration:
+        """Construct mT5 while preserving input sharing and output tying separately."""
+
+        tying = self.detect_weight_tying()
+        shared_encoder = bool(tying["shared_encoder_same_storage"])
+        shared_decoder = bool(tying["shared_decoder_same_storage"])
+        shared_output = bool(tying["shared_output_same_storage"])
+        if shared_encoder != shared_decoder:
+            raise UnsupportedModelError(
+                "asymmetric encoder/decoder sharing is not supported by the mT5 adapter"
+            )
+        if not shared_encoder and shared_output:
+            raise UnsupportedModelError(
+                "output-tied but input-untied mT5 structure is not supported"
+            )
+        config.tie_word_embeddings = shared_encoder
+        compact = MT5ForConditionalGeneration(config)
+        if shared_encoder and not shared_output:
+            source_output = self.model.get_output_embeddings()
+            if source_output is None or not isinstance(source_output, torch.nn.Linear):
+                raise UnsupportedModelError("untied mT5 output head must be linear")
+            compact.lm_head = torch.nn.Linear(
+                source_output.in_features,
+                int(config.vocab_size),
+                bias=source_output.bias is not None,
+            )
+        return compact
+
     def _write_common_artifacts(
         self, staging: Path, mapping: IdMapping, mode: str, profile_id: str
     ) -> dict[str, Any]:
@@ -443,6 +472,8 @@ class MT5Adapter(ModelAdapter):
         compact = MT5EncoderModel(config)
         compact_state = self._compact_state_dict(compact.state_dict(), mapping)
         compact.load_state_dict(compact_state, strict=True)
+        del compact_state
+        gc.collect()
         compact.eval()
         with atomic_output_directory(output) as staging:
             model_dir = staging / "model"
@@ -452,6 +483,8 @@ class MT5Adapter(ModelAdapter):
                 from vocabcraft.manifests import write_selection_artifacts
 
                 write_selection_artifacts(staging, selection, profile_id)
+            del compact
+            gc.collect()
             reloaded = MT5EncoderModel.from_pretrained(model_dir).eval()
             retained = torch.tensor(mapping.new_to_old, dtype=torch.long)
             expected = self.model.shared.weight.detach().index_select(0, retained)
@@ -476,8 +509,7 @@ class MT5Adapter(ModelAdapter):
         if mapping.original_vocab_size != self.model_vocab_size:
             raise ValidationFailure("mapping original size does not match model vocabulary size")
         config = self._compact_config(mapping)
-        config.tie_word_embeddings = bool(self.detect_weight_tying()["shared_output_same_storage"])
-        compact = MT5ForConditionalGeneration(config)
+        compact = self._new_compact_seq2seq_model(config)
         generation_config = copy.deepcopy(self.model.generation_config)
         self._apply_remapped_configuration(
             generation_config, remap_token_id_fields(generation_config, mapping)
@@ -485,6 +517,8 @@ class MT5Adapter(ModelAdapter):
         compact.generation_config = generation_config
         compact_state = self._compact_state_dict(compact.state_dict(), mapping)
         compact.load_state_dict(compact_state, strict=True)
+        del compact_state
+        gc.collect()
         compact.eval()
         with atomic_output_directory(output) as staging:
             model_dir = staging / "model"
@@ -494,6 +528,8 @@ class MT5Adapter(ModelAdapter):
                 from vocabcraft.manifests import write_selection_artifacts
 
                 write_selection_artifacts(staging, selection, profile_id)
+            del compact
+            gc.collect()
             from vocabcraft.models.mt5_seq2seq import load_compact_mt5_seq2seq_model
 
             reloaded = load_compact_mt5_seq2seq_model(model_dir)
@@ -527,10 +563,16 @@ class MT5Adapter(ModelAdapter):
         """Build a greedy-only guarded artifact when the output head is truly untied."""
 
         tying = self.detect_weight_tying()
-        if tying["shared_output_same_storage"] or tying["config_tie_word_embeddings"]:
+        if tying["shared_output_same_storage"]:
             raise UnsupportedModeError(
                 "seq2seq_guarded is unsafe for this checkpoint because the full output "
                 "projection is tied to the compact shared embedding"
+            )
+        if tying["config_tie_word_embeddings"]:
+            raise UnsupportedModeError(
+                "seq2seq_guarded is disabled because the configuration requests tied output "
+                "embeddings even though the loaded checkpoint has a distinct output head; "
+                "this inconsistent tying contract cannot be safely serialized for guarded mode"
             )
         if mapping.original_vocab_size != self.model_vocab_size:
             raise ValidationFailure("mapping original size does not match model vocabulary size")
@@ -547,6 +589,8 @@ class MT5Adapter(ModelAdapter):
         )
         compact_state = self._compact_state_dict(compact.state_dict(), mapping)
         compact.load_state_dict(compact_state, strict=True)
+        del compact_state
+        gc.collect()
         compact.eval()
         with atomic_output_directory(output) as staging:
             model_dir = staging / "model"
@@ -556,6 +600,8 @@ class MT5Adapter(ModelAdapter):
                 from vocabcraft.manifests import write_selection_artifacts
 
                 write_selection_artifacts(staging, selection, profile_id)
+            del compact
+            gc.collect()
             decoder_start = getattr(self.model.config, "decoder_start_token_id", None)
             eos = getattr(self.model.config, "eos_token_id", None)
             if not isinstance(decoder_start, int) or not isinstance(eos, int):

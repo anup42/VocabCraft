@@ -38,7 +38,7 @@ def test_rejects_renamed_project(tmp_path: Path) -> None:
     config = tmp_path / "bad-name.yaml"
     config.write_text(
         """
-project: {name: VocabGuard}
+project: {name: WrongName}
 model: {id: local-model}
 profile: {id: test, description: test profile, languages: [], unicode_scripts: []}
 """,
@@ -46,3 +46,24 @@ profile: {id: test, description: test profile, languages: [], unicode_scripts: [
     )
     with pytest.raises(ConfigurationError, match="must be VocabCraft"):
         load_config(config)
+
+
+def test_loads_local_external_evaluation_config(tmp_path: Path) -> None:
+    config = tmp_path / "external.yaml"
+    config.write_text(
+        """
+project: {name: VocabCraft}
+model: {id: local-model}
+profile: {id: test, description: test profile, languages: [], unicode_scripts: []}
+external_evaluation:
+  command: [python, private_eval.py, --model, "{model_path}"]
+  metrics_file: metrics.json
+  timeout_seconds: 60
+  non_inferiority: {metric: task_score, maximum_allowed_drop: 0.005}
+""",
+        encoding="utf-8",
+    )
+    loaded = load_config(config)
+    assert loaded.external_evaluation is not None
+    assert loaded.external_evaluation.metrics_file == tmp_path / "metrics.json"
+    assert loaded.external_evaluation.non_inferiority.metric == "task_score"

@@ -8,6 +8,7 @@ from vocabcraft.exceptions import UnsupportedModeError
 from vocabcraft.mappings import IdMapping
 from vocabcraft.models.mt5 import MT5Adapter
 from vocabcraft.models.mt5_guarded_generation import GuardedMT5Generator, load_guarded_mt5_model
+from vocabcraft.models.mt5_seq2seq import load_compact_mt5_seq2seq_model
 
 
 def _tiny_model() -> MT5ForConditionalGeneration:
@@ -112,3 +113,26 @@ def test_guarded_mode_rejects_tied_output_head(fake_tokenizer: object, tmp_path:
     mapping = IdMapping.from_retained(list(range(11)), 11)
     with pytest.raises(UnsupportedModeError, match="tied"):
         adapter.build_guarded_profile(mapping, tmp_path / "guarded")
+
+
+def test_seq2seq_preserves_shared_inputs_with_untied_output(
+    fake_tokenizer: object, tmp_path: Path
+) -> None:
+    config = MT5Config(
+        vocab_size=11,
+        d_model=16,
+        d_ff=32,
+        num_layers=1,
+        num_decoder_layers=1,
+        num_heads=2,
+    )
+    source = MT5ForConditionalGeneration(config)
+    source.lm_head = torch.nn.Linear(16, 11, bias=False)
+    adapter = MT5Adapter(source, fake_tokenizer, "mixed-tying-fixture")  # type: ignore[arg-type]
+    mapping = IdMapping.from_retained([0, 1, 2, 3, 4, 5, 7, 8, 9, 10], 11)
+    destination = tmp_path / "seq2seq-mixed-tying"
+    adapter.build_seq2seq_profile(mapping, destination, "test")
+    compact = load_compact_mt5_seq2seq_model(destination / "model")
+    assert compact.shared.weight.data_ptr() == compact.encoder.embed_tokens.weight.data_ptr()
+    assert compact.shared.weight.data_ptr() == compact.decoder.embed_tokens.weight.data_ptr()
+    assert compact.shared.weight.data_ptr() != compact.lm_head.weight.data_ptr()

@@ -1,3 +1,4 @@
+import copy
 from pathlib import Path
 
 import torch
@@ -16,7 +17,7 @@ def test_cold_pack_reconstructs_original_encoder_vocabulary_tensors(
     tmp_path: Path,
 ) -> None:
     _, mapping = en_hi_selection
-    source_encoder = MT5EncoderModel(mt5_adapter.model.config)
+    source_encoder = MT5EncoderModel(copy.deepcopy(mt5_adapter.model.config))
     full_state = mt5_adapter.model.state_dict()
     source_encoder.load_state_dict(
         {name: full_state[name] for name in source_encoder.state_dict()}, strict=True

@@ -31,7 +31,8 @@ def run_external_evaluation(
 
     if timeout_seconds < 1:
         raise ValueError("timeout_seconds must be positive")
-    resolved_model = str(Path(model_path).resolve())
+    candidate_model = Path(model_path)
+    resolved_model = str(candidate_model.resolve()) if candidate_model.exists() else str(model_path)
     expanded = [argument.replace("{model_path}", resolved_model) for argument in command]
     environment = {
         key: value

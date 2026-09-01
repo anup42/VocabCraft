@@ -116,6 +116,24 @@ class RuntimeConfig:
 
 
 @dataclass(frozen=True)
+class NonInferiorityConfig:
+    """Metric and maximum allowed aggregate drop for an external evaluation."""
+
+    metric: str
+    maximum_allowed_drop: float
+
+
+@dataclass(frozen=True)
+class ExternalEvaluationConfig:
+    """Local-only hidden evaluation command and declared metrics output."""
+
+    command: list[str]
+    metrics_file: Path
+    timeout_seconds: int
+    non_inferiority: NonInferiorityConfig
+
+
+@dataclass(frozen=True)
 class VocabCraftConfig:
     """Fully validated VocabCraft configuration."""
 
@@ -125,6 +143,7 @@ class VocabCraftConfig:
     fallback: FallbackConfig
     validation: ValidationConfig
     runtime: RuntimeConfig
+    external_evaluation: ExternalEvaluationConfig | None
     source_path: Path
 
 
@@ -148,6 +167,7 @@ def load_config(path: str | Path) -> VocabCraftConfig:
     fallback_raw = _mapping(raw.get("fallback", {}), "fallback")
     validation_raw = _mapping(raw.get("validation", {}), "validation")
     runtime_raw = _mapping(raw.get("runtime", {}), "runtime")
+    external_raw_object = raw.get("external_evaluation")
 
     model_id = model_raw.get("id")
     profile_id = profile_raw.get("id")
@@ -177,6 +197,39 @@ def load_config(path: str | Path) -> VocabCraftConfig:
     revision = model_raw.get("revision")
     if revision is not None and not isinstance(revision, str):
         raise ConfigurationError("model.revision must be null or a string")
+
+    external_evaluation: ExternalEvaluationConfig | None = None
+    if external_raw_object is not None:
+        external_raw = _mapping(external_raw_object, "external_evaluation")
+        non_inferiority_raw = _mapping(
+            external_raw.get("non_inferiority"), "external_evaluation.non_inferiority"
+        )
+        command = _string_list(external_raw.get("command"), "external_evaluation.command")
+        if not command:
+            raise ConfigurationError("external_evaluation.command cannot be empty")
+        metrics_file = external_raw.get("metrics_file")
+        metric = non_inferiority_raw.get("metric")
+        timeout = external_raw.get("timeout_seconds", 3600)
+        maximum_drop = non_inferiority_raw.get("maximum_allowed_drop")
+        if not isinstance(metrics_file, str) or not metrics_file:
+            raise ConfigurationError("external_evaluation.metrics_file must be a path string")
+        if not isinstance(metric, str) or not metric:
+            raise ConfigurationError("external_evaluation.non_inferiority.metric is required")
+        if not isinstance(timeout, int) or timeout < 1:
+            raise ConfigurationError("external_evaluation.timeout_seconds must be positive")
+        if not isinstance(maximum_drop, (int, float)) or maximum_drop < 0:
+            raise ConfigurationError(
+                "external_evaluation.non_inferiority.maximum_allowed_drop must be non-negative"
+            )
+        metrics_path = Path(metrics_file)
+        external_evaluation = ExternalEvaluationConfig(
+            command=command,
+            metrics_file=(
+                metrics_path if metrics_path.is_absolute() else source.parent / metrics_path
+            ),
+            timeout_seconds=timeout,
+            non_inferiority=NonInferiorityConfig(metric, float(maximum_drop)),
+        )
 
     config = VocabCraftConfig(
         project=ProjectConfig(
@@ -269,8 +322,19 @@ def load_config(path: str | Path) -> VocabCraftConfig:
             device=device,
             batch_size=batch_size,
         ),
+        external_evaluation=external_evaluation,
         source_path=source,
     )
     if config.project.name != "VocabCraft":
         raise ConfigurationError("project.name must be VocabCraft")
+    if (
+        config.validation.encoder_max_absolute_difference < 0
+        or config.validation.encoder_mean_absolute_difference < 0
+        or config.validation.teacher_forcing_max_absolute_difference < 0
+    ):
+        raise ConfigurationError("validation difference tolerances must be non-negative")
+    if not -1.0 <= config.validation.minimum_encoder_cosine_similarity <= 1.0:
+        raise ConfigurationError(
+            "validation.minimum_encoder_cosine_similarity must be between -1 and 1"
+        )
     return config

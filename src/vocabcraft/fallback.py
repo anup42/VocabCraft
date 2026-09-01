@@ -33,6 +33,14 @@ class GuardDecision:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class GuardedBatch:
+    """Row-wise guard decisions with the original tokenizer attention mask."""
+
+    decisions: list[GuardDecision]
+    attention_mask: list[list[int]]
+
+
 def guard_original_ids(
     original_ids: list[int],
     mapping: IdMapping,
@@ -112,6 +120,39 @@ class ProfiledTokenizer:
             )
             for row in original_ids
         ]
+
+    def batch_encode(
+        self,
+        texts: list[str],
+        *,
+        padding: bool = True,
+        add_special_tokens: bool = True,
+    ) -> GuardedBatch:
+        """Tokenize/pad a batch originally, preserve masks, then guard each complete row."""
+
+        encoded = self.original_tokenizer(
+            texts,
+            padding=padding,
+            add_special_tokens=add_special_tokens,
+            return_attention_mask=True,
+        )
+        input_ids = encoded.get("input_ids")
+        attention_mask = encoded.get("attention_mask")
+        if not isinstance(input_ids, list) or not all(
+            isinstance(row, list) and all(isinstance(value, int) for value in row)
+            for row in input_ids
+        ):
+            raise ValueError("original tokenizer batch input_ids must be integer lists")
+        if not isinstance(attention_mask, list) or not all(
+            isinstance(row, list) and all(isinstance(value, int) for value in row)
+            for row in attention_mask
+        ):
+            raise ValueError("original tokenizer attention_mask must be integer lists")
+        if len(input_ids) != len(attention_mask) or any(
+            len(ids) != len(mask) for ids, mask in zip(input_ids, attention_mask, strict=True)
+        ):
+            raise ValueError("batch input IDs and attention masks have inconsistent shapes")
+        return GuardedBatch(self.guard_batch(input_ids), attention_mask)
 
     def decode(self, compact_ids: list[int], **kwargs: Any) -> str:
         """Map compact IDs back and decode with the unchanged tokenizer."""

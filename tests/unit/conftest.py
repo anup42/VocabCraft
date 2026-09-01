@@ -102,9 +102,18 @@ class FakeTokenizer:
         return " ".join(self.pieces[token_id] for token_id in token_ids)
 
     def __call__(self, text: str | list[str], **kwargs: Any) -> dict[str, Any]:
-        del kwargs
         texts: Sequence[str] = [text] if isinstance(text, str) else text
-        return {"input_ids": [self.encode(item) for item in texts]}
+        rows = [
+            self.encode(item, add_special_tokens=bool(kwargs.get("add_special_tokens", True)))
+            for item in texts
+        ]
+        if kwargs.get("padding", False):
+            width = max(len(row) for row in rows)
+            masks = [[1] * len(row) + [0] * (width - len(row)) for row in rows]
+            rows = [row + [self.pad_token_id] * (width - len(row)) for row in rows]
+        else:
+            masks = [[1] * len(row) for row in rows]
+        return {"input_ids": rows, "attention_mask": masks}
 
     def save_pretrained(self, destination: str | Path) -> tuple[str]:
         path = Path(destination)

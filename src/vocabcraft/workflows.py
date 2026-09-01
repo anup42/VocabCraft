@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import copy
 import time
 from collections.abc import Sequence
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Literal, cast
 
 import torch
@@ -21,7 +23,9 @@ from vocabcraft.config import VocabCraftConfig
 from vocabcraft.evaluation.coverage import evaluate_coverage
 from vocabcraft.evaluation.datasets import stream_jsonl
 from vocabcraft.evaluation.encoder_equivalence import compare_encoder_models
+from vocabcraft.evaluation.external_hook import run_external_evaluation
 from vocabcraft.evaluation.generation import compare_greedy_generation
+from vocabcraft.evaluation.non_inferiority import paired_bootstrap_non_inferiority
 from vocabcraft.evaluation.teacher_forcing import compare_teacher_forcing
 from vocabcraft.exceptions import ArtifactError, ValidationFailure
 from vocabcraft.fallback import guard_original_ids
@@ -325,6 +329,75 @@ def validate_to_directory(
         and coverage.new_unk_count <= config.validation.maximum_new_unk_count
         and encoder_pass
     )
+    external_result: dict[str, Any] | None = None
+    if config.external_evaluation is not None:
+        external = config.external_evaluation
+        original_external = run_external_evaluation(
+            external.command,
+            model_path=original_identifier,
+            metrics_file=external.metrics_file,
+            timeout_seconds=external.timeout_seconds,
+        )
+        compact_external = run_external_evaluation(
+            external.command,
+            model_path=root,
+            metrics_file=external.metrics_file,
+            timeout_seconds=external.timeout_seconds,
+        )
+        original_metrics = original_external["metrics"]
+        compact_metrics = compact_external["metrics"]
+        if not isinstance(original_metrics, dict) or not isinstance(compact_metrics, dict):
+            raise ValidationFailure("external evaluation metrics must be JSON objects")
+        metric_name = external.non_inferiority.metric
+        original_metric = original_metrics.get(metric_name)
+        compact_metric = compact_metrics.get(metric_name)
+        if not isinstance(original_metric, (int, float)) or not isinstance(
+            compact_metric, (int, float)
+        ):
+            raise ValidationFailure(f"external metrics are missing numeric {metric_name!r}")
+        original_scores = original_metrics.get("per_example_scores")
+        compact_scores = compact_metrics.get("per_example_scores")
+        statistical_result: dict[str, Any] | None = None
+        aggregate_passed = (
+            float(original_metric) - float(compact_metric)
+            <= external.non_inferiority.maximum_allowed_drop
+        )
+        if (
+            isinstance(original_scores, list)
+            and isinstance(compact_scores, list)
+            and all(isinstance(value, (int, float)) for value in original_scores)
+            and all(isinstance(value, (int, float)) for value in compact_scores)
+        ):
+            statistical_result = paired_bootstrap_non_inferiority(
+                [float(value) for value in original_scores],
+                [float(value) for value in compact_scores],
+                maximum_allowed_drop=external.non_inferiority.maximum_allowed_drop,
+            )
+        external_result = {
+            "metric": metric_name,
+            "original_metric": float(original_metric),
+            "compact_metric": float(compact_metric),
+            "maximum_allowed_drop": external.non_inferiority.maximum_allowed_drop,
+            "aggregate_threshold_passed": aggregate_passed,
+            "paired_bootstrap": statistical_result,
+            "statistical_non_inferiority_established": (
+                statistical_result["non_inferiority_passed"]
+                if statistical_result is not None
+                else False
+            ),
+            "aggregate_only_warning": (
+                None
+                if statistical_result is not None
+                else "Aggregate metrics do not establish statistical non-inferiority."
+            ),
+            "original_run": original_external,
+            "compact_run": compact_external,
+        }
+        passed = (
+            passed
+            and aggregate_passed
+            and (statistical_result is None or bool(statistical_result["non_inferiority_passed"]))
+        )
     validation = {
         "mode": mode,
         "passed": passed,
@@ -332,6 +405,7 @@ def validate_to_directory(
         "encoder_equivalence": encoder_results,
         "teacher_forcing": teacher_results,
         "generation": generation_results,
+        "external_evaluation": external_result,
         "strict_failures": strict_failures,
     }
     with atomic_output_directory(output) as staging:
@@ -366,6 +440,17 @@ def _vocabulary_parameter_count(model: Any, *vocabulary_sizes: int) -> int:
     return sum(value.numel() for value in storages.values())
 
 
+def _source_encoder_model(adapter: MT5Adapter) -> MT5EncoderModel:
+    model = MT5EncoderModel(copy.deepcopy(adapter.model.config))
+    source_state = adapter.model.state_dict()
+    model.load_state_dict(
+        {name: source_state[name].detach().clone() for name in model.state_dict()},
+        strict=True,
+    )
+    model.eval()
+    return model
+
+
 def benchmark_to_directory(
     original_identifier: str,
     compact_artifact: str | Path,
@@ -391,6 +476,13 @@ def benchmark_to_directory(
     else:
         raise ArtifactError(f"unsupported benchmark artifact mode: {mode!r}")
     compact_load_seconds = time.perf_counter() - start
+    original_benchmark_model: Any = (
+        _source_encoder_model(adapter) if mode == "encoder_exact" else adapter.model
+    )
+    with TemporaryDirectory(prefix="vocabcraft-original-") as temporary:
+        original_serialized = Path(temporary) / "model"
+        original_benchmark_model.save_pretrained(original_serialized, safe_serialization=True)
+        actual_original_serialized_bytes = serialized_size(original_serialized)
     covered_source: list[int] | None = None
     all_rows: list[list[int]] = []
     tokenization_times: list[float] = []
@@ -408,7 +500,7 @@ def benchmark_to_directory(
     original_ids = torch.tensor([covered_source], dtype=torch.long)
     compact_ids = torch.tensor([compact_source], dtype=torch.long)
     original_forward = benchmark_encoder_forward(
-        adapter.model, original_ids, torch.ones_like(original_ids)
+        original_benchmark_model, original_ids, torch.ones_like(original_ids)
     )
     compact_forward = benchmark_encoder_forward(
         compact_model, compact_ids, torch.ones_like(compact_ids)
@@ -423,24 +515,32 @@ def benchmark_to_directory(
     original_vocab = adapter.model_vocab_size
     compact_vocab = len(mapping.new_to_old)
     embedding_dimension = adapter.model.shared.weight.shape[1]
+    original_vocabulary_parameters = _vocabulary_parameter_count(
+        original_benchmark_model, original_vocab
+    )
+    compact_vocabulary_parameters = _vocabulary_parameter_count(
+        compact_model, compact_vocab, original_vocab
+    )
+    original_total_parameters = sum(
+        parameter.numel() for parameter in original_benchmark_model.parameters()
+    )
+    compact_total_parameters = sum(parameter.numel() for parameter in compact_model.parameters())
     report = {
         "mode": mode,
         "original_vocabulary_size": original_vocab,
         "retained_vocabulary_size": compact_vocab,
         "excluded_vocabulary_size": original_vocab - compact_vocab,
         "retained_percentage": 100.0 * compact_vocab / original_vocab,
-        "original_vocabulary_dependent_parameter_count": _vocabulary_parameter_count(
-            adapter.model, original_vocab
+        "original_vocabulary_dependent_parameter_count": original_vocabulary_parameters,
+        "compact_vocabulary_dependent_parameter_count": compact_vocabulary_parameters,
+        "original_non_vocabulary_parameter_count": (
+            original_total_parameters - original_vocabulary_parameters
         ),
-        "compact_vocabulary_dependent_parameter_count": _vocabulary_parameter_count(
-            compact_model, compact_vocab, original_vocab
+        "compact_non_vocabulary_parameter_count": (
+            compact_total_parameters - compact_vocabulary_parameters
         ),
-        "original_total_parameter_count": sum(
-            parameter.numel() for parameter in adapter.model.parameters()
-        ),
-        "compact_total_parameter_count": sum(
-            parameter.numel() for parameter in compact_model.parameters()
-        ),
+        "original_total_parameter_count": original_total_parameters,
+        "compact_total_parameter_count": compact_total_parameters,
         "theoretical_single_embedding_bytes_original": theoretical_vocabulary_bytes(
             original_vocab, embedding_dimension
         ),
@@ -448,16 +548,18 @@ def benchmark_to_directory(
             compact_vocab, embedding_dimension
         ),
         "actual_compact_artifact_bytes": serialized_size(root),
-        "actual_original_serialized_bytes": None,
-        "actual_original_serialized_bytes_note": (
-            "Remote cache layout is not treated as a portable serialized artifact measurement."
-        ),
+        "actual_compact_serialized_model_bytes": serialized_size(root / "model"),
+        "actual_original_serialized_bytes": actual_original_serialized_bytes,
         "original_model_load_seconds": original_load_seconds,
         "compact_model_load_seconds": compact_load_seconds,
         "tokenization_time_ms_mean": sum(tokenization_times) / len(tokenization_times),
         "mapping": benchmark_mapping(mapping, all_rows),
         "original_encoder_forward": original_forward,
         "compact_encoder_forward": compact_forward,
+        "resident_memory_note": (
+            "Peak process RSS includes both loaded source and compact models; it is not an "
+            "isolated active-model memory measurement."
+        ),
         "fallback_rate": coverage.to_dict()["fallback_rate"],
         "energy_measured": False,
     }
@@ -480,12 +582,7 @@ def build_pack_to_directory(
     excluded = sorted(set(range(mapping.original_vocab_size)) - set(mapping.new_to_old))
     mode = metadata.get("vocabcraft_mode")
     if mode == "encoder_exact":
-        source_model = MT5EncoderModel(adapter.model.config)
-        source_state = adapter.model.state_dict()
-        encoder_state = {
-            name: source_state[name].detach().clone() for name in source_model.state_dict()
-        }
-        source_model.load_state_dict(encoder_state, strict=True)
+        source_model = _source_encoder_model(adapter)
         vocabulary_state = source_model.state_dict()
     elif mode in {"seq2seq_compact", "seq2seq_guarded"}:
         vocabulary_state = adapter.model.state_dict()
