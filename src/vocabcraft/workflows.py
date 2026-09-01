@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Literal, cast
 
 import torch
-from transformers import MT5EncoderModel, MT5ForConditionalGeneration
+from transformers import MT5EncoderModel
 
 from vocabcraft.artifacts import atomic_output_directory, read_json, write_json
 from vocabcraft.benchmarking import (
@@ -34,6 +34,7 @@ from vocabcraft.models.mt5_guarded_generation import (
     GuardedMT5Generator,
     load_guarded_mt5_model,
 )
+from vocabcraft.models.mt5_seq2seq import load_compact_mt5_seq2seq_model
 from vocabcraft.packs import (
     build_cold_pack,
     merge_packs,
@@ -209,7 +210,7 @@ def validate_to_directory(
                 {"id": record.id, "metadata": record.metadata, "comparison": comparison}
             )
     elif mode == "seq2seq_compact":
-        compact_seq2seq = MT5ForConditionalGeneration.from_pretrained(root / "model").eval()
+        compact_seq2seq = load_compact_mt5_seq2seq_model(root / "model")
         for record in stream_jsonl(data_path):
             source_ids = adapter.tokenizer.encode(record.source, add_special_tokens=True)
             source_decision = guard_original_ids(
@@ -262,6 +263,7 @@ def validate_to_directory(
                                 source_ids,
                                 target_ids,
                                 mapping,
+                                config.validation.teacher_forcing_max_absolute_difference,
                             ),
                         }
                     )
@@ -383,7 +385,7 @@ def benchmark_to_directory(
     if mode == "encoder_exact":
         compact_model: Any = MT5EncoderModel.from_pretrained(root / "model").eval()
     elif mode == "seq2seq_compact":
-        compact_model = MT5ForConditionalGeneration.from_pretrained(root / "model").eval()
+        compact_model = load_compact_mt5_seq2seq_model(root / "model")
     elif mode == "seq2seq_guarded":
         compact_model = load_guarded_mt5_model(root / "model", mapping.original_vocab_size)
     else:

@@ -21,7 +21,7 @@ from vocabcraft.exceptions import (
     UnsupportedModelError,
     ValidationFailure,
 )
-from vocabcraft.hashing import sha256_bytes, sha256_json
+from vocabcraft.hashing import sha256_bytes, sha256_file, sha256_json
 from vocabcraft.mappings import IdMapping, remap_token_id_fields
 from vocabcraft.models.base import ModelAdapter
 from vocabcraft.selection import SelectionResult
@@ -83,6 +83,9 @@ def _tokenizer_hash(tokenizer: Any) -> str:
         data = serialized()
         if isinstance(data, bytes):
             return sha256_bytes(data)
+    vocabulary_file = getattr(tokenizer, "vocab_file", None)
+    if isinstance(vocabulary_file, str) and Path(vocabulary_file).is_file():
+        return sha256_file(vocabulary_file)
     pieces = [tokenizer.convert_ids_to_tokens(token_id) for token_id in range(len(tokenizer))]
     return sha256_json(pieces)
 
@@ -93,15 +96,31 @@ def _sentencepiece_details(tokenizer: Any) -> dict[str, Any]:
         "model_type": None,
         "normalization": None,
     }
+    serialized_data: bytes | None = None
     processor = getattr(tokenizer, "sp_model", None)
     serialized = getattr(processor, "serialized_model_proto", None)
-    if not callable(serialized):
+    if callable(serialized):
+        candidate = serialized()
+        if isinstance(candidate, bytes):
+            serialized_data = candidate
+    vocabulary_file = getattr(tokenizer, "vocab_file", None)
+    if serialized_data is None and isinstance(vocabulary_file, str):
+        try:
+            serialized_data = Path(vocabulary_file).read_bytes()
+        except OSError:
+            serialized_data = None
+    if serialized_data is None:
+        backend_tokenizer = getattr(tokenizer, "backend_tokenizer", None)
+        backend_model = getattr(backend_tokenizer, "model", None)
+        if backend_model is not None:
+            result["model_type"] = type(backend_model).__name__.upper()
+            result["normalization"] = str(getattr(backend_tokenizer, "normalizer", "unavailable"))
         return result
     try:
         from sentencepiece import sentencepiece_model_pb2
 
         proto = sentencepiece_model_pb2.ModelProto()
-        proto.ParseFromString(serialized())
+        proto.ParseFromString(serialized_data)
         result["model_type"] = sentencepiece_model_pb2.TrainerSpec.ModelType.Name(
             proto.trainer_spec.model_type
         )
@@ -127,10 +146,13 @@ def _generation_ids(generation_config: Any | None) -> dict[str, Any]:
 
 
 def _special_ids(tokenizer: Any, config: Any) -> dict[str, Any]:
+    additional = getattr(tokenizer, "additional_special_tokens", None)
+    if additional is None:
+        additional = getattr(tokenizer, "extra_special_tokens", [])
     result: dict[str, Any] = {
         "all_special_ids": list(tokenizer.all_special_ids),
         "all_special_tokens": list(tokenizer.all_special_tokens),
-        "additional_special_tokens": list(tokenizer.additional_special_tokens),
+        "additional_special_tokens": list(additional),
     }
     for name in (
         "pad_token_id",
@@ -140,11 +162,11 @@ def _special_ids(tokenizer: Any, config: Any) -> dict[str, Any]:
         "decoder_start_token_id",
     ):
         result[name] = getattr(config, name, getattr(tokenizer, name, None))
-    result["extra_ids"] = sorted(
+    result["extra_ids"] = [
         token_id
-        for token_id in tokenizer.all_special_ids
-        if str(tokenizer.convert_ids_to_tokens(token_id)).startswith("<extra_id_")
-    )
+        for token_id in range(len(tokenizer))
+        if str(tokenizer.convert_ids_to_tokens(token_id)).lstrip("▁").startswith("<extra_id_")
+    ]
     return result
 
 
@@ -454,6 +476,7 @@ class MT5Adapter(ModelAdapter):
         if mapping.original_vocab_size != self.model_vocab_size:
             raise ValidationFailure("mapping original size does not match model vocabulary size")
         config = self._compact_config(mapping)
+        config.tie_word_embeddings = bool(self.detect_weight_tying()["shared_output_same_storage"])
         compact = MT5ForConditionalGeneration(config)
         generation_config = copy.deepcopy(self.model.generation_config)
         self._apply_remapped_configuration(
@@ -471,7 +494,9 @@ class MT5Adapter(ModelAdapter):
                 from vocabcraft.manifests import write_selection_artifacts
 
                 write_selection_artifacts(staging, selection, profile_id)
-            reloaded = MT5ForConditionalGeneration.from_pretrained(model_dir).eval()
+            from vocabcraft.models.mt5_seq2seq import load_compact_mt5_seq2seq_model
+
+            reloaded = load_compact_mt5_seq2seq_model(model_dir)
             retained = torch.tensor(mapping.new_to_old, dtype=torch.long)
             expected = self.model.shared.weight.detach().index_select(0, retained)
             if not torch.equal(reloaded.shared.weight, expected):

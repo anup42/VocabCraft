@@ -102,6 +102,7 @@ class ValidationConfig:
     encoder_max_absolute_difference: float = 1.0e-5
     encoder_mean_absolute_difference: float = 1.0e-6
     minimum_encoder_cosine_similarity: float = 0.999999
+    teacher_forcing_max_absolute_difference: float = 5.0e-5
     generation_exact_match_required: bool = False
 
 
@@ -255,6 +256,9 @@ def load_config(path: str | Path) -> VocabCraftConfig:
             ),
             minimum_encoder_cosine_similarity=float(
                 validation_raw.get("minimum_encoder_cosine_similarity", 0.999999)
+            ),
+            teacher_forcing_max_absolute_difference=float(
+                validation_raw.get("teacher_forcing_max_absolute_difference", 5.0e-5)
             ),
             generation_exact_match_required=bool(
                 validation_raw.get("generation_exact_match_required", False)

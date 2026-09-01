@@ -16,6 +16,7 @@ def compare_teacher_forcing(
     source_original_ids: list[int],
     target_original_ids: list[int],
     mapping: IdMapping,
+    maximum_absolute_difference: float = 5.0e-5,
 ) -> dict[str, Any]:
     """Compare retained raw logits and losses while flagging softmax limitations."""
 
@@ -34,6 +35,8 @@ def compare_teacher_forcing(
     retained_original_logits = original_output.logits.index_select(-1, retained)
     logits = compare_tensors(retained_original_logits, compact_output.logits)
     return {
+        "passed": logits.maximum_absolute_difference <= maximum_absolute_difference,
+        "maximum_allowed_absolute_difference": maximum_absolute_difference,
         "retained_raw_logits": logits.to_dict(),
         "original_loss": float(original_output.loss.item()),
         "compact_loss": float(compact_output.loss.item()),

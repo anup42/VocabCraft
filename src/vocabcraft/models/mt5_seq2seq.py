@@ -5,13 +5,27 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, cast
 
-from transformers import AutoTokenizer, MT5ForConditionalGeneration
+from transformers import AutoTokenizer, MT5Config, MT5ForConditionalGeneration
 
 from vocabcraft.artifacts import read_json
 from vocabcraft.exceptions import ArtifactError
 from vocabcraft.fallback import FallbackPolicyName, ProfiledTokenizer
 from vocabcraft.mappings import IdMapping
 from vocabcraft.tokenizers.base import OriginalTokenizer
+
+
+def load_compact_mt5_seq2seq_model(path: str | Path) -> MT5ForConditionalGeneration:
+    """Reload local mT5 while preserving the serialized output-tying decision."""
+
+    root = Path(path)
+    config_payload = read_json(root / "config.json")
+    if not isinstance(config_payload, dict):
+        raise ArtifactError("compact mT5 config must be a JSON object")
+    config = MT5Config.from_dict(config_payload)
+    config.tie_word_embeddings = bool(config_payload.get("tie_word_embeddings", True))
+    model = MT5ForConditionalGeneration.from_pretrained(root, config=config)
+    model.eval()
+    return model
 
 
 class CompactMT5Seq2Seq:
@@ -47,8 +61,7 @@ class CompactMT5Seq2Seq:
         if not isinstance(mapping_payload, dict):
             raise ArtifactError("mapping report must be a JSON object")
         mapping = IdMapping.from_dict(mapping_payload)
-        model = MT5ForConditionalGeneration.from_pretrained(root / "model")
-        model.eval()
+        model = load_compact_mt5_seq2seq_model(root / "model")
         tokenizer = cast(
             OriginalTokenizer,
             AutoTokenizer.from_pretrained(root / "tokenizer", use_fast=False),

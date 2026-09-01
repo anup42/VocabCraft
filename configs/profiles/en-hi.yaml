@@ -50,10 +50,10 @@ validation:
   encoder_max_absolute_difference: 1.0e-5
   encoder_mean_absolute_difference: 1.0e-6
   minimum_encoder_cosine_similarity: 0.999999
+  teacher_forcing_max_absolute_difference: 5.0e-5
   generation_exact_match_required: false
 
 runtime:
   dtype: auto
   device: cpu
   batch_size: 4
-

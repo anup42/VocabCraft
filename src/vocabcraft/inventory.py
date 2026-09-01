@@ -10,7 +10,7 @@ from vocabcraft.tokenizers.base import OriginalTokenizer
 from vocabcraft.tokenizers.sentencepiece import sentencepiece_piece_metadata
 from vocabcraft.unicode_analysis import analyze_piece
 
-_EXTRA_ID = re.compile(r"<extra_id_\d+>")
+_EXTRA_ID = re.compile(r"▁?<extra_id_\d+>")
 
 
 @dataclass

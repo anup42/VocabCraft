@@ -288,7 +288,9 @@ def reconstruct_full_artifact(
         compact_model = MT5EncoderModel.from_pretrained(root / "model")
         original_model = MT5EncoderModel(source_config)
     elif mode == "seq2seq_compact":
-        compact_model = MT5ForConditionalGeneration.from_pretrained(root / "model")
+        from vocabcraft.models.mt5_seq2seq import load_compact_mt5_seq2seq_model
+
+        compact_model = load_compact_mt5_seq2seq_model(root / "model")
         original_model = MT5ForConditionalGeneration(source_config)
     elif mode == "seq2seq_guarded":
         from vocabcraft.models.mt5_guarded_generation import load_guarded_mt5_model
