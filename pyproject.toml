@@ -62,6 +62,14 @@ strict = true
 warn_unused_ignores = true
 exclude = ["tests"]
 
+[[tool.mypy.overrides]]
+module = [
+  "vocabcraft.models.mt5",
+  "vocabcraft.models.mt5_encoder",
+  "vocabcraft.models.mt5_seq2seq",
+]
+disable_error_code = ["no-untyped-call"]
+
 [tool.pytest.ini_options]
 addopts = "-ra"
 testpaths = ["tests"]

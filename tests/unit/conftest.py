@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Any, ClassVar
 
 import pytest
@@ -50,6 +51,10 @@ class FakeTokenizer:
         return ["<pad>", "</s>", "<unk>", "<extra_id_0>"]
 
     @property
+    def additional_special_tokens(self) -> list[str]:
+        return ["<extra_id_0>"]
+
+    @property
     def pad_token_id(self) -> int:
         return 0
 
@@ -96,6 +101,13 @@ class FakeTokenizer:
         del kwargs
         texts: Sequence[str] = [text] if isinstance(text, str) else text
         return {"input_ids": [self.encode(item) for item in texts]}
+
+    def save_pretrained(self, destination: str | Path) -> tuple[str]:
+        path = Path(destination)
+        path.mkdir(parents=True, exist_ok=True)
+        vocabulary = path / "fake-vocabulary.txt"
+        vocabulary.write_text("\n".join(self.pieces), encoding="utf-8")
+        return (str(vocabulary),)
 
 
 @pytest.fixture
