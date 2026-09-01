@@ -1,0 +1,59 @@
+project:
+  name: VocabCraft
+  version: 0.1
+
+model:
+  id: google/mt5-small
+  revision: null
+  trust_remote_code: false
+
+profile:
+  id: en-hi-v1
+  description: English and Hindi on-device vocabulary profile
+  languages: [en, hi]
+  unicode_scripts: [Latin, Devanagari]
+  allow_common_script: true
+  allow_inherited_script: true
+  allow_code_switching: true
+  allow_romanized_hindi: true
+  allow_ascii_digits: true
+  allow_native_digits: true
+  allow_punctuation: true
+  allow_currency_symbols: true
+  allow_math_symbols: true
+  allow_urls: true
+  allow_emails: true
+  allow_emoji: true
+  keep_all_special_tokens: true
+  keep_all_control_tokens: true
+  keep_all_extra_ids: true
+  keep_unknown_token: true
+  keep_single_character_pieces_for_allowed_scripts: true
+  calibration_files:
+    - ../../examples/calibration-en-hi.jsonl
+  critical_terms_files:
+    - ../../examples/critical-terms.txt
+  manual_keep_ids: []
+  manual_remove_ids: []
+  manual_keep_pieces: []
+  manual_remove_pieces: []
+  strict: true
+
+fallback:
+  policy: full_model
+  fail_closed_when_unavailable: true
+  record_missing_pieces: true
+
+validation:
+  maximum_new_unk_count: 0
+  maximum_missing_critical_examples: 0
+  encoder_max_absolute_difference: 1.0e-5
+  encoder_mean_absolute_difference: 1.0e-6
+  minimum_encoder_cosine_similarity: 0.999999
+  generation_exact_match_required: false
+
+runtime:
+  dtype: auto
+  device: cpu
+  batch_size: 4
+

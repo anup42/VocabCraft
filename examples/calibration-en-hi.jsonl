@@ -1,0 +1,15 @@
+{"id":"enc-en-001","text":"Where is my phone?","language":"en","domain":"assistant","critical":false}
+{"id":"enc-hi-001","text":"मेरा फोन कहाँ है?","language":"hi","domain":"assistant","critical":false}
+{"id":"enc-mix-001","text":"Ravi, mera Galaxy phone कहाँ है?","language":"en-hi","domain":"assistant","critical":true}
+{"id":"enc-roman-001","text":"Mera phone Dilli mein kho gaya hai","language":"hi-Latn","domain":"assistant","critical":false}
+{"id":"enc-names-001","text":"Ravi and Ananya are meeting Priya in Bengaluru.","language":"en","domain":"contacts","critical":true}
+{"id":"enc-products-001","text":"Samsung Galaxy and Google Pixel are product names.","language":"en","domain":"commerce","critical":true}
+{"id":"enc-url-001","text":"Visit https://example.in/a?q=फोन or email ravi@example.com.","language":"en-hi","domain":"web","critical":false}
+{"id":"enc-date-001","text":"Meeting: 02/09/2026 at १०:३०; price ₹1,299.50!","language":"en-hi","domain":"calendar","critical":false}
+{"id":"enc-emoji-001","text":"Great!!! धन्यवाद 😊👍🏽 #done","language":"en-hi","domain":"chat","critical":false}
+{"id":"enc-noise-001","text":"pleeease opn teh app kal subh; कॉल शायद कट गइ","language":"en-hi","domain":"noisy-input","critical":false,"noise":["typing","asr","ocr"]}
+{"id":"enc-mixed-001","text":"दिल्लीMetro se Noida चलो","language":"en-hi","domain":"maps","critical":false}
+{"id":"enc-unsupported-001","text":"東京へ行きます","language":"ja","domain":"fallback-demo","critical":false,"expected":"fallback"}
+{"id":"seq-001","source":"Translate to Hindi: Where is my phone?","target":"मेरा फोन कहाँ है?","source_language":"en","target_language":"hi","task":"translation","domain":"assistant","critical":true}
+{"id":"seq-002","source":"हिंदी में उत्तर दें: Ravi is in Delhi.","target":"रवि दिल्ली में है।","source_language":"en-hi","target_language":"hi","task":"translation","domain":"assistant","critical":true}
+

@@ -1,0 +1,6 @@
+evaluation:
+  data: ../../examples/calibration-en-hi.jsonl
+  deterministic: true
+  max_output_length: 32
+  seed: 2026
+

@@ -1,0 +1,31 @@
+project:
+  name: VocabCraft
+  version: 0.1
+
+model:
+  id: google/mt5-small
+  revision: null
+  trust_remote_code: false
+
+profile:
+  id: example-24-languages-v0
+  description: Template for a future product-wide language profile
+  # TODO: Supply the real product-wide 24-language list before using this profile.
+  languages: []
+  unicode_scripts: []
+  calibration_files: []
+  critical_terms_files: []
+  manual_keep_ids: []
+  manual_remove_ids: []
+
+fallback:
+  policy: full_model
+  fail_closed_when_unavailable: true
+  record_missing_pieces: true
+
+validation: {}
+runtime:
+  device: cpu
+  dtype: auto
+  batch_size: 4
+
