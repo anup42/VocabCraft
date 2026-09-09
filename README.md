@@ -8,16 +8,18 @@ The transformer layers and the original tokenizer are preserved. Compaction
 uses deterministic rules and calibration examples; it does not train a new
 tokenizer, fine-tune the model, distill it, or quantize its weights.
 
-The first adapter supports mT5, with `google/mt5-small` as the demonstration
-checkpoint. The `en-hi-v1` profile targets English, Hindi, Latin/Devanagari text,
+Adapters support mT5 (`google/mt5-small`) and encoder-only XLM-RoBERTa, including
+the supplied STE SentenceTransformers checkpoint (`24_lang_base_model`).
+XLM-R supports `encoder_exact` and masked-mean sentence embeddings; the two
+generation modes remain mT5-only. The example profiles target English, Hindi, Latin/Devanagari text,
 code switching, romanized Hindi, names, URLs, email, numbers, symbols, emoji,
 and noisy input. These are retention goals, not a guarantee of complete
 coverage of those inputs.
 
 `encoder_exact` is the best-tested path. Both generation modes are experimental.
-The [review findings](#current-review-findings) below describe implementation
-gaps, including why the top-level validation result alone is insufficient for
-accepting a generation profile.
+The [review fixes](#review-fixes-and-remaining-boundaries) below describe enforced
+validation gates and the remaining deployment boundaries. Smoke equivalence is
+not a substitute for task-quality evaluation.
 
 ## How it works
 
@@ -26,7 +28,7 @@ before using it.
 
 ```mermaid
 flowchart TD
-    A[Original mT5 model and tokenizer] --> B[Inspect tensors, IDs and weight sharing]
+    A[Original supported model and tokenizer] --> B[Inspect tensors, IDs and weight sharing]
     B --> C[Inventory and conservative token selection]
     P[Profile rules, calibration and critical terms] --> C
     C --> D[Sort retained IDs and copy selected weight rows]
@@ -40,7 +42,8 @@ flowchart TD
 
 ### 1. Inspect the actual model
 
-`MT5Adapter.inspect_model()` records tokenizer and model vocabulary sizes,
+Architecture dispatch reads `config.model_type`; `MT5Adapter.inspect_model()`
+and `XLMRobertaAdapter.inspect_model()` record tokenizer and model vocabulary sizes,
 embedding dimensions, special IDs, generation settings, dependency versions,
 model-state/tokenizer hashes, and tensors with a vocabulary-sized dimension.
 `detect_weight_tying()` checks tensor storage pointers as well as configuration:
@@ -50,7 +53,11 @@ relationships even when `tie_word_embeddings` is set.
 This matters for both correctness and memory accounting. Copying a shared
 matrix multiple times wastes space; accidentally tying distinct input/output
 weights changes model behavior. The adapter validates supported mT5 structures
-and rejects tensor shapes it cannot compact safely.
+and rejects tensor shapes it cannot compact safely. For XLM-R, only
+`embeddings.word_embeddings.weight` is pruned. Position and token-type embeddings,
+transformer blocks, and any dense pooler stay unchanged. Explicit tensor names
+prevent a coincidentally vocabulary-sized hidden or position dimension from
+being mistaken for a vocabulary axis.
 
 ### 2. Build an inventory and select a retained set
 
@@ -113,7 +120,10 @@ compact_E[old_to_new[i]] = original_E[i]   for every retained original ID i
 The adapter uses PyTorch `index_select(0, retained_ids)` for vocabulary rows and
 copies the remaining tensors. Supported special and generation ID fields are
 remapped in copied configurations. Safetensors checkpoints are saved and
-reloaded, and retained shared embedding rows are checked with `torch.equal`.
+reloaded, and retained embedding rows are checked with `torch.equal`.
+The XLM-R builder also checks every reloaded non-vocabulary tensor exactly and
+preserves checkpoint dtype. Its padding ID must keep its numeric index: XLM-R
+derives position IDs from that index, so remapping it would change hidden states.
 
 For a single matrix with `V` rows, width `d`, and `b` bytes per element, storage
 is `V * d * b`. Retaining `K` rows saves `(V - K) * d * b` bytes for that matrix.
@@ -126,7 +136,7 @@ be accounted for separately when estimating total savings.
 | --- | --- | --- |
 | `encoder_exact` | Compact encoder embeddings; preserve encoder transformer weights. Export an encoder-only model. | Covered inputs use the same embedding values, token sequence length, and attention mask. Measure numerical equivalence in evaluation mode. It does not generate text. |
 | `seq2seq_compact` | Compact encoder/decoder input embeddings and output projection; preserve remaining encoder/decoder weights. | Smaller output vocabulary can change probabilities and generated text. Input coverage does not guarantee output equivalence. |
-| `seq2seq_guarded` | Compact input embeddings while keeping the full original output projection. | Custom greedy loop checks generated original IDs before their next decoder embedding lookup. Requires a supported untied output head and a consistent tying configuration. |
+| `seq2seq_guarded` | Compact input embeddings while keeping the full original output projection. | Transformers greedy generation with original-ID logits processors and a guarded decoder-embedding lookup. Requires a supported untied output head and a consistent tying configuration. |
 
 For `encoder_exact`, unchanged inputs and transformer weights explain why
 covered encoder states should agree, subject to numerical precision and runtime
@@ -145,17 +155,21 @@ Changing the denominator alone does not change the ordering of retained logits.
 Greedy decoding can still diverge when the original winning token was removed;
 sampling probabilities, beam scores, and losses can change as well.
 
-`GuardedMT5Generator.generate_greedy()` computes full-vocabulary logits, takes
-`argmax`, and checks the selected original ID. If a required input/generated
-embedding is missing and a full model is supplied, it restarts the request on
-that full model. Otherwise it returns an unsupported result. It accepts one
-request at a time, uses `use_cache=False`, and requires a positive output limit.
-It rejects sampling and beam search. Its raw-argmax loop does not implement the
-full Transformers generation-processor pipeline; see the review findings.
+`GuardedMT5Generator.generate_greedy()` uses the public Transformers `generate()`
+pipeline with full-vocabulary logits and original-ID forced tokens, suppression,
+repetition constraints, and stopping settings. A decoder embedding pre-hook
+guards/maps IDs only at lookup time. If a required row is missing, it restarts
+the whole request on a supplied full model with the same generation settings;
+without a handler it returns an unsupported result. Calls through the wrappers
+are serialized per compact model and hooks are removed even on failure. Do not
+call that model directly during a guarded request. Only deterministic greedy
+decoding with a positive output limit is supported; sampling, beams, wall-clock
+stopping, and other unsupported generation settings are rejected explicitly.
 
 ## Safety model
 
-The conservative path keeps the original SentencePiece tokenizer unchanged. It
+The conservative path keeps the original tokenizer unchanged, including
+backend-only Unigram tokenizers saved as `tokenizer.json`. It
 first obtains the original token IDs, checks that every ID has a retained row,
 and only then maps the sequence to contiguous compact IDs. A missing ID is never
 silently replaced by UNK, PAD, zero, a similar token, or an estimated embedding.
@@ -173,7 +187,8 @@ pre-existing limitation. Missing compact rows are a different condition and are
 never converted into UNK.
 
 The `full_model` policy is a requested action, not automatic model loading.
-`CompactMT5Encoder.encode()` returns `(None, decision_dict)` for unsupported
+`CompactMT5Encoder.encode()` and `CompactXLMRobertaEncoder.encode()` return
+`(None, decision_dict)` for unsupported
 inputs, and `CompactMT5Seq2Seq.generate_greedy()` returns `generated: false`.
 Applications must inspect these results and dispatch or reject the request.
 `FallbackExecutor.execute()` can call a caller-supplied full-model function or
@@ -185,10 +200,13 @@ See [safety-model.md](docs/safety-model.md) and
 
 ## Installation
 
-Python 3.11 or newer is required. The current CLI, runtime wrappers, and
-benchmarks execute on CPU. Although the YAML schema includes runtime device,
-dtype, and batch-size fields, those fields are not currently wired into model
-execution.
+Python 3.11 or newer is required. The CLI, wrappers, and benchmarks execute on
+CPU; unsupported devices and precision-conversion requests fail explicitly.
+`runtime.dtype: auto` uses the adapter's loading policy (XLM-R preserves the
+source dtype); `float32`/`fp32` additionally requires loaded FP32 weights.
+Compaction does not cast or quantize them. `runtime.batch_size` controls padded
+encoder-validation batches. `fail_closed_when_unavailable: false` is rejected;
+`record_missing_pieces: false` suppresses piece text in configured guard reports.
 
 ```powershell
 python -m pip install -e ".[dev]"
@@ -225,8 +243,8 @@ selection. Disabling a special-token flag cannot remove a mandatory ID.
 
 Set `model.revision` to an exact source revision for reproducible analysis,
 builds, and validation. `inspect-model` has a separate `--revision` option.
-`benchmark` and `build-pack` have no revision option; use a local checkpoint
-from the matching revision. Source-hash mismatches abort those workflows.
+`benchmark` and `build-pack` reuse the compact artifact's saved source revision.
+Source-model and tokenizer-hash mismatches abort those workflows.
 
 ## mT5-small walkthrough
 
@@ -313,31 +331,95 @@ reading `text`. A successful result includes both compact and original output
 IDs. Always use these wrappers or the mapping/guard APIs: the saved tokenizer
 still emits original IDs and cannot be passed directly to the compact model.
 
+## STE / XLM-R sentence-embedding walkthrough
+
+The supplied local `24_lang_base_model` is a 12-layer XLM-R encoder with a
+250,002-row, 384-dimensional word matrix. Its saved SentenceTransformers
+pipeline is **Transformer + mean Pooling**, not the dense XLM-R pooler output.
+No training or SentenceTransformers dependency is needed to prune it.
+
+Use the complete local checkpoint directory so its pooling, prompts, maximum
+sequence length, and lowercasing settings can be read. Hub identifiers support
+bare XLM-R encoders, but remote SentenceTransformers pipeline discovery is not
+implemented. Other pooling modes, extra modules, MLM heads, and dimension
+truncation are rejected rather than silently discarded.
+
+```powershell
+$steModel = 'C:\Users\anupk\Downloads\ste\STE\24_lang_base_model'
+vocabcraft inspect-model --model $steModel --output artifacts/ste-inspection
+vocabcraft build-profile --model $steModel --profile configs/profiles/ste-en-hi.yaml --mode encoder_exact --output artifacts/ste-en-hi
+vocabcraft validate --original $steModel --compact artifacts/ste-en-hi --profile configs/profiles/ste-en-hi.yaml --data examples/smoke-en-hi.jsonl --output artifacts/ste-validation
+vocabcraft benchmark --original $steModel --compact artifacts/ste-en-hi --data examples/smoke-en-hi.jsonl --output artifacts/ste-benchmark
+vocabcraft build-pack --model $steModel --compact artifacts/ste-en-hi --output artifacts/ste-cold-pack
+vocabcraft reconstruct-full --compact artifacts/ste-en-hi --pack artifacts/ste-cold-pack --output artifacts/ste-reconstructed
+```
+
+The example profile reuses English/Hindi calibration. The checkpoint folder name
+does not specify the desired 24-language retention policy; customize scripts,
+calibration, and critical terms before building a wider deployment profile.
+The source checkpoint, optimizer, and training files are never modified.
+
+```python
+from vocabcraft.models.xlm_roberta import CompactXLMRobertaEncoder
+
+encoder = CompactXLMRobertaEncoder.from_artifact("artifacts/ste-en-hi")
+vector, decision = encoder.embed("Ravi का फोन", normalize_embeddings=True)
+if vector is None:
+    # Supply your original full-model service here, or reject the request.
+    raise RuntimeError(f"Full model required: {decision['missing_original_ids']}")
+print(vector.shape)  # torch.Size([384])
+
+vectors, decisions = encoder.embed_batch(["Open the phone", "東京へ行きます"])
+# Input order is preserved; an uncovered row is None with a fallback decision.
+```
+
+`encode()` returns token-level hidden states; `embed()`/`embed_batch()` return
+sentence vectors. The saved prompt (or explicit `prompt`/`prompt_name`),
+lowercasing, and truncation are applied before guarding the tokens actually
+consumed by the model. This checkpoint truncates to 512 tokens and has empty
+query/document prompts. Calibration selection remains conservative and
+untruncated. Dynamic batch padding preserves the original attention mask.
+
+For token states `h[t]` and attention mask `m[t]`, the sentence method is:
+
+```text
+sentence = sum(h[t] * m[t]) / max(sum(m[t]), epsilon)
+normalized_sentence = sentence / max(L2_norm(sentence), epsilon)  # optional
+```
+
+Padding is excluded; attended special tokens and prompt tokens are included,
+matching this saved pooling configuration. Always use the VocabCraft wrapper:
+loading the compact directory directly as a `SentenceTransformer` would omit
+the required original-to-compact ID guard and mapping.
+
 ## Validation and benchmarking methods
 
 | Method | What the implementation measures |
 | --- | --- |
 | Coverage | Source/target token coverage, fully covered records, missing IDs/pieces, affected critical examples, and fallback-required records. If a target exists, it also affects record coverage. |
-| Encoder equivalence | Embeddings, optional intermediate states, and final hidden states with identical attention masks in `eval()`/`no_grad()` mode. Reports maximum/mean absolute error, maximum relative error, and cosine similarities. The pass criterion uses final-state maximum/mean absolute error and whole-sequence cosine similarity. |
+| Encoder equivalence | Embeddings, intermediate states, and final hidden states with identical attention masks in `eval()`/`no_grad()` mode. Padding is excluded from comparisons. Gates use per-example final-state maximum/mean absolute error and both token and sequence cosine similarity. Saved sentence pipelines also gate masked-mean and normalized vectors. |
 | Teacher forcing | Feed known source and target IDs to both models, select the original logits for retained rows, and compare them with compact logits. Report both losses; unequal softmax denominators make equal losses unnecessary. |
 | Greedy comparison | Generate with `do_sample=False`, `num_beams=1`; map compact outputs back and compare original IDs, decoded text, first divergence, lengths, and EOS presence. CLI validation uses 32 new tokens. |
-| External task evaluation | Run a configured local command for the original and compact models using `{model_path}`; read its declared metrics JSON. The command must understand a compact artifact's tokenizer and mapping. |
+| External task evaluation | Run a configured local command for each model using `{model_path}`. Prefer `{metrics_file}` for a unique output file per run; legacy fixed paths must show a fresh file update. Validate finite metric values and paired score lists. The command must understand a compact artifact's tokenizer and mapping. |
 | Paired bootstrap | Resample paired per-example score differences (`compact - original`) 10,000 times with seed 2026. The lower endpoint of a 95% percentile interval must be at least the negative allowed drop. Scores must be aligned and higher-is-better. Aggregate thresholds alone are also supported, but do not establish statistical non-inferiority. |
 | CPU benchmark | Time encoder forward passes on the first fully covered source example, with 2 warmups and 10 measured iterations. Separately time tokenization and ID mapping; mapping repeats across all covered source rows 100 times. |
 
 Read the JSON reports for per-example details; the Markdown reports contain
 scalar summaries. Coverage reports count requests needing fallback, not completed
-full-model fallback executions. Their `new_unk_count` is currently fixed to zero
-by the unchanged-tokenizer/guard accounting; it is not an independent observation
-of a second inference pipeline.
+full-model fallback executions. Missing-token counts include repeated occurrences
+and distinguish source/target languages. `new_unk_count` compares original UNKs
+with the original-to-compact-to-original mapped IDs on covered sequences; it
+does not measure a downstream model's generated output or fallback execution.
 
-`validate` exits with code 3 when its aggregate `passed` field is false, but that
-field currently combines critical coverage, new-UNK accounting, encoder final
-state tolerances, and optional external metrics. Teacher-forcing failures and
-generation mismatches are only reported, even if
-`generation_exact_match_required: true`. An empty or fully uncovered noncritical
-corpus can also pass without an actual model comparison. Inspect comparison
-counts and results before accepting an artifact.
+`validate` exits with code 3 when `passed` is false. It requires nonempty data
+and at least one mode-appropriate comparison; fully uncovered data cannot pass.
+Critical coverage, new-UNK accounting, encoder and teacher-forcing failures,
+and optional external metrics are enforced. Compact generation exact-ID/text
+matching is enforced when `generation_exact_match_required: true`; guarded
+generation always requires successful original-ID matching, including full-model
+restarts. `comparison_counts` distinguishes evaluated paths. A passing report
+can still contain fallback-required examples: inspect the coverage and fallback
+rate before choosing a deployment policy.
 
 Benchmarking runs the encoder even for seq2seq artifacts; it does not measure
 decoder throughput or fallback service latency. Theoretical FP16/BF16 sizes are
@@ -362,8 +444,34 @@ restored state tensors exactly.
 
 Reconstruction is offline. An encoder artifact plus its pack restores the full
 vocabulary **encoder**, not the omitted decoder. Runtime pack swapping or NPU
-loading is not implemented. The real-model reconstruction test covers encoder
-vocabulary tensors; do not generalize it to every seq2seq tying configuration.
+loading is not implemented. Reconstruction restores original generation token
+settings and preserves supported tied, untied, and mixed mT5 storage structures.
+Offline tests exercise all three modes; real STE tests compare every restored
+state tensor, not only the word matrix.
+
+## Recorded STE smoke results
+
+September 10, 2026: real local checkpoint, `ste-en-hi-v1` profile, FP32,
+Transformers 5.16.1 and PyTorch 2.13.0+cpu. Generated files are under ignored
+`artifacts/ste-20260910-*`; weights are not committed to Git.
+
+| Measurement | Result |
+| --- | --- |
+| Original / retained / excluded word rows | 250,002 / 123,304 / 126,698 |
+| Word-embedding dimensions | 384, unchanged |
+| Original / compact word parameters | 96,000,768 / 47,348,736; 50.68% fewer |
+| Original / compact total parameters | 117,640,704 / 68,988,672 |
+| Non-vocabulary parameters | 21,639,936, unchanged |
+| Serialized original / compact model bytes | 470,585,941 / 275,977,813; 41.35% smaller |
+| Entire compact artifact, including tokenizer/manifests | 303,931,538 bytes |
+| Covered / fallback-required smoke records | 13 / 1 of 14 |
+| Covered hidden, mean-pooled, normalized comparisons | All 13 passed; maximum absolute difference 0.0 in each category |
+| Reload and cold-pack reconstruction | All expected tensors exactly equal; restored 250,002 rows |
+| Short CPU encoder benchmark, original / compact mean | 19.24 / 20.20 ms; no speedup demonstrated |
+
+This is a storage reduction, not transformer-layer pruning. The small latency
+sample includes normal runtime variation and is not evidence of acceleration.
+No product-quality or complete 24-language claim follows from these smoke tests.
 
 ## Recorded mT5-small smoke results
 
@@ -406,8 +514,9 @@ contract explicitly.
   the original tokenizer artifacts.
 - `vocabcraft-metadata.json`, `source-config.json`,
   `source-generation-config.json`: source hashes, sizes, mode, and source
-  configurations. The saved generation configuration is not currently restored
-  by `reconstruct-full`.
+  configurations. Original generation settings are restored by reconstruction.
+- `sentence-embedding-config.json`: XLM-R sentence preprocessing/pooling settings
+  (or null for a bare encoder), checked against the saved configuration hash.
 - `validation.json` / `validation.md`: coverage, per-example equivalence,
   teacher-forced, generation, and strict-failure results.
 - `benchmark.json` / `benchmark.md`: separately labeled theoretical bytes,
@@ -437,21 +546,27 @@ Real-model integration is explicitly gated:
 
 ```powershell
 $env:RUN_MT5_INTEGRATION = "1"
-pytest tests/integration
+pytest tests/integration -k mt5
+
+$env:RUN_STE_INTEGRATION = "1"
+$env:STE_MODEL_PATH = 'C:\Users\anupk\Downloads\ste\STE\24_lang_base_model'
+pytest tests/integration/test_ste_embedding_compaction.py
+# Optional: reuse an existing matching artifact to avoid rebuilding:
+# $env:STE_ARTIFACT_PATH = 'artifacts/ste-20260910-en-hi'
 ```
 
 Integration exercises real tokenizer metadata, inspection, selection, encoder
 row copying/equivalence/fallback, experimental seq2seq logits/generation, cold
 packs, and exact reconstruction.
 
-The September 8, 2026 code review reran all 46 offline unit tests, Ruff, and mypy
-successfully. Those checks do not cover every end-to-end validation failure or
-generation configuration; the findings below remain open.
-The README Python example was also executed against the saved compact encoder
-and returned a `[1, 5, 512]` hidden-state tensor. A separate Japanese input
-returned a fallback decision with three missing IDs. Targeted offline review
-checks reproduced the ignored validation failures and forced-token divergence
-in guarded generation.
+The September 10 update adds offline regression coverage for failed validation
+gates, stale metrics, corrupt mappings, guarded generation constraints, padding,
+pooling, dtype preservation, tensor-dimension collisions, and reconstruction.
+All 159 offline unit tests, Ruff, and mypy passed. All four real STE integration
+tests passed, plus the actual CLI build, validation,
+benchmark, and reconstruction workflows. The older real mT5 suite could not be
+rerun offline because its full source checkpoint was no longer in the local
+Hugging Face cache; its historical results above are labeled separately.
 
 ## Methods and source map
 
@@ -461,26 +576,32 @@ in guarded generation.
 | Unicode/SentencePiece inventory | [inventory.py](src/vocabcraft/inventory.py), [unicode_analysis.py](src/vocabcraft/unicode_analysis.py), [sentencepiece.py](src/vocabcraft/tokenizers/sentencepiece.py) |
 | Calibration and retained-set selection | [selection.py](src/vocabcraft/selection.py): `observe_calibration`, `observe_critical_terms`, `select_profile` |
 | ID bijection and guard/fallback | [mappings.py](src/vocabcraft/mappings.py): `IdMapping`; [fallback.py](src/vocabcraft/fallback.py): `ProfiledTokenizer`, `FallbackExecutor` |
-| Inspection and row-copy builders | [mt5.py](src/vocabcraft/models/mt5.py): `MT5Adapter` |
+| Architecture dispatch and row-copy builders | [registry.py](src/vocabcraft/models/registry.py), [mt5.py](src/vocabcraft/models/mt5.py), [xlm_roberta.py](src/vocabcraft/models/xlm_roberta.py) |
+| Sentence vectors and preprocessing | [xlm_roberta.py](src/vocabcraft/models/xlm_roberta.py): `CompactXLMRobertaEncoder`, `pool_sentence_embeddings`, `tokenize_embedding_text` |
 | Runtime loaders and generation | [mt5_encoder.py](src/vocabcraft/models/mt5_encoder.py), [mt5_seq2seq.py](src/vocabcraft/models/mt5_seq2seq.py), [mt5_guarded_generation.py](src/vocabcraft/models/mt5_guarded_generation.py) |
 | Numerical and task evaluation | [evaluation/](src/vocabcraft/evaluation/), especially `compare_encoder_models`, `compare_teacher_forcing`, `compare_greedy_generation`, `paired_bootstrap_non_inferiority` |
 | Packs, artifact publishing, and reports | [packs.py](src/vocabcraft/packs.py), [artifacts.py](src/vocabcraft/artifacts.py), [reporting.py](src/vocabcraft/reporting.py), [benchmarking.py](src/vocabcraft/benchmarking.py) |
 
-## Current review findings
+## Review fixes and remaining boundaries
 
-These are limitations of the current implementation, not completed fixes.
+The September 10 review fixes the previously documented failures:
 
-| Finding | Practical consequence |
+| Issue | Implemented fix |
 | --- | --- |
-| Validation aggregation omits teacher-forcing and generation outcomes, and permits zero comparisons. | `passed: true` or CLI exit code 0 is insufficient evidence for generation equivalence or even that a model comparison ran. `generation_exact_match_required` is parsed but unused. |
-| Guarded generation uses raw `argmax` without Transformers logits processors. | Forced tokens, suppression, repetition constraints, and other generation settings can differ from `full_model.generate()` even when every row is retained. Use only an independently verified plain-greedy configuration. |
-| Runtime and fallback configuration includes inactive fields. | `runtime.device`, `runtime.dtype`, and `runtime.batch_size` do not control execution. `fail_closed_when_unavailable` and `record_missing_pieces` do not alter behavior; decisions always record missing pieces and unavailable executor handlers fail closed. |
-| External evaluation does not verify that its metrics file was freshly written. | A successful subprocess that leaves an old file in place can cause stale metrics to be accepted. Evaluators must overwrite their declared file on every run. |
-| Artifact provenance checks have limited scope. | The tokenizer hash covers the SentencePiece model/vocab file, or a pieces fallback, rather than every tokenizer setting. Per-piece type flags depend on an available `sp_model`; backend-only tokenizers may have incomplete type annotations. |
+| Ignored validation outcomes / zero comparisons | Mode-aware gates now enforce configured checks and require actual evidence. |
+| Raw-argmax guarded generation | Original-ID Transformers generation processors, guarded decoder lookup, and identical-settings full restart. |
+| Inactive runtime settings | CPU and precision constraints are explicit; encoder validation batches; missing-piece reporting honors its flag. |
+| Stale external metrics | Unique per-run output placeholder or freshness verification; nonfinite/misaligned scores rejected. |
+| Weak tokenizer/config provenance | New artifacts fingerprint tokenizer behavior and XLM-R sentence settings; encoder loaders verify them. |
+| Incorrect occurrence and UNK accounting | Repeated missing IDs and target languages counted; compact-path UNKs measured after mapping roundtrip. |
+| Reconstruction edge cases | Empty packs, corrupt ID order/types, original generation settings, and supported mixed tying covered. |
+| Wrong encoder dispatch / vocabulary-axis inference | Encoder-only XLM-R keeps its embedding/position pipeline; adapters declare exact vocabulary tensor names. |
 
-The next implementation priorities are to enforce every configured validation
-gate, require meaningful comparison coverage, align or reject unsupported guarded
-generation settings, and wire or reject inactive runtime configuration.
+Legacy artifacts lacking fingerprints retain weaker provenance checks; rebuild
+them for the new checks. Backend-only tokenizers can still have incomplete
+per-piece SentencePiece type annotations. Script rules remain heuristic and
+additive; production use needs representative task evaluation and an explicit
+fallback service. These fixes do not establish universal generation equivalence.
 
 ## Extending VocabCraft
 
