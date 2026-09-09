@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from vocabcraft.artifacts import atomic_output_directory, write_json
-from vocabcraft.models.mt5 import MT5Adapter
+from vocabcraft.models.registry import load_adapter
 
 
 def inspection_markdown(report: dict[str, Any]) -> str:
@@ -31,10 +31,7 @@ def inspection_markdown(report: dict[str, Any]) -> str:
         "",
         "## Weight relationships",
         "",
-        f"- Shared is encoder embedding: {tying['shared_is_encoder_embedding']}",
-        f"- Shared is decoder embedding: {tying['shared_is_decoder_embedding']}",
-        f"- Shared storage equals output head: {tying['shared_output_same_storage']}",
-        f"- Configuration requests tied output embeddings: {tying['config_tie_word_embeddings']}",
+        *(f"- {key}: `{value}`" for key, value in tying.items() if key != "pointers"),
         "",
         "## Safety note",
         "",
@@ -45,16 +42,16 @@ def inspection_markdown(report: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def inspect_mt5_to_directory(
+def inspect_model_to_directory(
     model_identifier: str,
     output: str | Path,
     *,
     revision: str | None = None,
     trust_remote_code: bool = False,
 ) -> dict[str, Any]:
-    """Load mT5, inspect actual runtime structure, and atomically write reports."""
+    """Dispatch a supported architecture and atomically write inspection reports."""
 
-    adapter = MT5Adapter.from_pretrained(
+    adapter = load_adapter(
         model_identifier,
         revision=revision,
         trust_remote_code=trust_remote_code,
@@ -64,3 +61,7 @@ def inspect_mt5_to_directory(
         write_json(staging / "inspection.json", report)
         (staging / "inspection.md").write_text(inspection_markdown(report), encoding="utf-8")
     return report
+
+
+# Preserve the original public entry point for existing clients.
+inspect_mt5_to_directory = inspect_model_to_directory

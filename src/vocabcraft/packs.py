@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+import gc
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -10,7 +12,15 @@ from typing import Any
 
 import torch
 from safetensors.torch import load_file, save_file
-from transformers import AutoTokenizer, MT5Config, MT5EncoderModel, MT5ForConditionalGeneration
+from transformers import (
+    AutoTokenizer,
+    GenerationConfig,
+    MT5Config,
+    MT5EncoderModel,
+    MT5ForConditionalGeneration,
+    XLMRobertaConfig,
+    XLMRobertaModel,
+)
 
 from vocabcraft import __version__
 from vocabcraft.artifacts import atomic_output_directory, read_json, write_json
@@ -34,13 +44,25 @@ def _tensor_sha256(tensor: torch.Tensor) -> str:
 
 
 def _vocabulary_rows(
-    state_dict: dict[str, torch.Tensor], original_ids: tuple[int, ...], vocabulary_size: int
+    state_dict: dict[str, torch.Tensor],
+    original_ids: tuple[int, ...],
+    vocabulary_size: int,
+    vocabulary_tensor_names: Sequence[str] | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any]]:
     index = torch.tensor(original_ids, dtype=torch.long)
     tensors: dict[str, torch.Tensor] = {}
     metadata: dict[str, Any] = {}
+    if vocabulary_tensor_names is not None and set(vocabulary_tensor_names) - set(state_dict):
+        raise ArtifactError("declared vocabulary tensor is missing from source state")
     for name, tensor in sorted(state_dict.items()):
-        axes = [axis for axis, size in enumerate(tensor.shape) if size == vocabulary_size]
+        if vocabulary_tensor_names is not None:
+            if name not in vocabulary_tensor_names:
+                continue
+            if tensor.ndim == 0 or tensor.shape[0] != vocabulary_size:
+                raise ArtifactError(f"declared vocabulary tensor {name} has no leading vocab axis")
+            axes = [0]
+        else:
+            axes = [axis for axis, size in enumerate(tensor.shape) if size == vocabulary_size]
         if not axes:
             continue
         if axes != [0]:
@@ -85,6 +107,7 @@ def build_cold_pack(
     tokenizer_hash: str,
     source_revision: str | None,
     profile_id: str,
+    vocabulary_tensor_names: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Export exact excluded rows and compatibility metadata atomically."""
 
@@ -93,7 +116,9 @@ def build_cold_pack(
         raise ArtifactError("pack original IDs must be unique")
     if any(token_id < 0 or token_id >= original_vocab_size for token_id in ordered):
         raise ArtifactError("pack original ID is outside the source vocabulary")
-    tensors, tensor_metadata = _vocabulary_rows(state_dict, ordered, original_vocab_size)
+    tensors, tensor_metadata = _vocabulary_rows(
+        state_dict, ordered, original_vocab_size, vocabulary_tensor_names
+    )
     manifest: dict[str, Any] = {
         "format_version": 1,
         "pack_type": "cold_fallback",
@@ -136,10 +161,22 @@ def load_pack(path: str | Path) -> LoadedPack:
         if expected_tensors.get(name) != _tensor_sha256(tensor):
             raise ArtifactError(f"pack tensor checksum mismatch: {name}")
     original_ids = tuple(ids_object)
+    vocabulary_size = manifest_object.get("original_vocab_size")
+    if (
+        type(vocabulary_size) is not int
+        or vocabulary_size < 1
+        or tuple(sorted(set(original_ids))) != original_ids
+        or any(type(value) is not int or not 0 <= value < vocabulary_size for value in original_ids)
+    ):
+        raise ArtifactError("pack IDs must be sorted, unique, and within the original vocabulary")
+    if set(tensors) != set(expected_tensors) or sorted(tensors) != manifest_object.get(
+        "tensor_names"
+    ):
+        raise ArtifactError("pack tensor names disagree with manifest/checksums")
     if manifest_object.get("original_ids") != list(original_ids):
         raise ArtifactError("pack manifest and original-ids.json disagree")
     for name, tensor in tensors.items():
-        if tensor.shape[0] != len(original_ids):
+        if tensor.ndim == 0 or tensor.shape[0] != len(original_ids):
             raise ArtifactError(f"pack tensor {name} row count does not match ID count")
     return LoadedPack(original_ids, tensors, manifest_object)
 
@@ -181,7 +218,11 @@ def merge_packs(pack_paths: Sequence[str | Path], destination: str | Path) -> di
         if set(values) != set(merged_ids):
             raise PackConflictError(f"tensor {name} does not cover every merged ID")
     tensors = {
-        name: torch.stack([values[token_id] for token_id in merged_ids])
+        name: (
+            torch.stack([values[token_id] for token_id in merged_ids])
+            if merged_ids
+            else reference.tensors[name][:0].clone()
+        )
         for name, values in sorted(rows.items())
     }
     manifest = dict(reference.manifest)
@@ -263,7 +304,7 @@ def reconstruct_full_artifact(
     pack_path: str | Path,
     destination: str | Path,
 ) -> dict[str, Any]:
-    """Rebuild a reloadable original-vocabulary mT5 artifact offline."""
+    """Rebuild a reloadable original-vocabulary model artifact offline."""
 
     root = Path(compact_artifact)
     metadata = read_json(root / "vocabcraft-metadata.json")
@@ -280,48 +321,95 @@ def reconstruct_full_artifact(
     if pack.manifest.get("tokenizer_sha256") != metadata.get("tokenizer_sha256"):
         raise PackConflictError("pack tokenizer hash does not match compact artifact")
     mode = metadata.get("vocabcraft_mode")
+    from vocabcraft.models.registry import artifact_family, load_encoder_model
+
+    family = artifact_family(metadata)
     compact_model: Any
     original_model: Any
-    source_config = MT5Config.from_dict(source_config_payload)
-    source_config.tie_word_embeddings = bool(source_config_payload.get("tie_word_embeddings", True))
-    if mode == "encoder_exact":
-        compact_model = MT5EncoderModel.from_pretrained(root / "model")
+    source_config: Any
+    if family == "xlm-roberta":
+        if mode != "encoder_exact":
+            raise ArtifactError("XLM-R reconstruction supports only encoder_exact")
+        source_config = XLMRobertaConfig.from_dict(source_config_payload)
+        compact_model = load_encoder_model(root, metadata)
+        original_model = XLMRobertaModel(
+            source_config, add_pooling_layer=bool(metadata.get("add_pooling_layer", False))
+        )
+    elif mode == "encoder_exact":
+        source_config = MT5Config.from_dict(source_config_payload)
+        source_config.tie_word_embeddings = bool(
+            source_config_payload.get("tie_word_embeddings", True)
+        )
+        compact_model = load_encoder_model(root, metadata)
         original_model = MT5EncoderModel(source_config)
     elif mode == "seq2seq_compact":
         from vocabcraft.models.mt5_seq2seq import load_compact_mt5_seq2seq_model
 
+        source_config = MT5Config.from_dict(source_config_payload)
+        source_config.tie_word_embeddings = bool(
+            source_config_payload.get("tie_word_embeddings", True)
+        )
         compact_model = load_compact_mt5_seq2seq_model(root / "model")
-        original_model = MT5ForConditionalGeneration(source_config)
+        from vocabcraft.models.mt5 import MT5Adapter
+
+        tokenizer = AutoTokenizer.from_pretrained(root / "tokenizer", use_fast=False)
+        adapter = MT5Adapter(compact_model, tokenizer, "reconstruction")
+        original_model = adapter._new_compact_seq2seq_model(copy.deepcopy(source_config))
     elif mode == "seq2seq_guarded":
         from vocabcraft.models.mt5_guarded_generation import load_guarded_mt5_model
 
+        source_config = MT5Config.from_dict(source_config_payload)
+        source_config.tie_word_embeddings = False
         compact_model = load_guarded_mt5_model(root / "model", mapping.original_vocab_size)
         original_model = MT5ForConditionalGeneration(source_config)
     else:
         raise ArtifactError(f"unsupported compact artifact mode for reconstruction: {mode!r}")
     restored_state = reconstruct_vocabulary_tensors(compact_model.state_dict(), mapping, pack)
+    original_model.to(dtype=next(compact_model.parameters()).dtype)
     original_model.load_state_dict(restored_state, strict=True)
+    generation_path = root / "source-generation-config.json"
+    if mode != "encoder_exact" and generation_path.is_file():
+        generation_payload = read_json(generation_path)
+        if not isinstance(generation_payload, dict):
+            raise ArtifactError("source generation configuration must be a JSON object")
+        original_model.generation_config = GenerationConfig.from_dict(generation_payload)
+    del compact_model
+    gc.collect()
     with atomic_output_directory(destination) as staging:
         model_dir = staging / "model"
         original_model.save_pretrained(model_dir, safe_serialization=True)
-        tokenizer = AutoTokenizer.from_pretrained(root / "tokenizer", use_fast=False)
+        tokenizer = AutoTokenizer.from_pretrained(
+            root / "tokenizer", use_fast=family == "xlm-roberta"
+        )
         tokenizer.save_pretrained(staging / "tokenizer")
+        sentence_config = root / "sentence-embedding-config.json"
+        if sentence_config.is_file():
+            write_json(staging / sentence_config.name, read_json(sentence_config))
         result = {
             "format_version": 1,
             "source_compact_artifact": str(root.resolve()),
             "source_pack": str(Path(pack_path).resolve()),
             "mode": mode,
+            "model_family": family,
             "restored_vocabulary_size": mapping.original_vocab_size,
             "reconstruction_complete": True,
         }
         write_json(staging / "reconstruction.json", result)
-        reloaded_state = (
-            MT5EncoderModel.from_pretrained(model_dir).state_dict()
-            if mode == "encoder_exact"
-            else MT5ForConditionalGeneration.from_pretrained(
-                model_dir, config=source_config
-            ).state_dict()
-        )
+        del original_model
+        gc.collect()
+        if mode == "encoder_exact":
+            if family == "xlm-roberta":
+                from vocabcraft.models.xlm_roberta import load_xlm_roberta_model
+
+                reloaded_state = load_xlm_roberta_model(
+                    model_dir, add_pooling_layer=bool(metadata.get("add_pooling_layer", False))
+                ).state_dict()
+            else:
+                reloaded_state = MT5EncoderModel.from_pretrained(model_dir).state_dict()
+        else:
+            from vocabcraft.models.mt5_seq2seq import load_compact_mt5_seq2seq_model
+
+            reloaded_state = load_compact_mt5_seq2seq_model(model_dir).state_dict()
         if set(reloaded_state) != set(restored_state) or any(
             not torch.equal(reloaded_state[name], value) for name, value in restored_state.items()
         ):

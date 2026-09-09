@@ -24,6 +24,10 @@ def paired_bootstrap_non_inferiority(
         raise ValueError("iterations must be at least 100")
     if not 0.0 < confidence < 1.0:
         raise ValueError("confidence must be between zero and one")
+    if not np.isfinite(maximum_allowed_drop) or maximum_allowed_drop < 0:
+        raise ValueError("maximum_allowed_drop must be finite and non-negative")
+    if not all(np.isfinite(value) for value in original_scores + compact_scores):
+        raise ValueError("paired scores must be finite")
     differences = np.asarray(compact_scores, dtype=np.float64) - np.asarray(
         original_scores, dtype=np.float64
     )

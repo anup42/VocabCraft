@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,7 @@ class CoverageReport:
     missing_ids_by_domain: dict[str, dict[int, int]]
     missing_critical_examples: list[str]
     original_unk_count: int
+    original_unk_count_on_compact_path: int
     compact_path_unk_count: int
     new_unk_count: int
     fallback_examples: int
@@ -61,6 +63,11 @@ class CoverageReport:
                 "warning": (
                     "Finite calibration coverage is not proof of complete language coverage."
                 ),
+                "unk_accounting_note": (
+                    "Original UNKs include every source/target sequence. Compact-path UNKs "
+                    "are counted after original-to-compact-to-original mapping of fully "
+                    "covered sequences only; fallback sequences are excluded."
+                ),
             }
         )
         return result
@@ -73,8 +80,10 @@ def evaluate_coverage(
     *,
     profile_id: str,
     fallback_policy: FallbackPolicyName,
+    encode_text: Callable[[str], list[int]] | None = None,
+    record_missing_pieces: bool = True,
 ) -> CoverageReport:
-    """Stream calibration records and measure source/target guard outcomes."""
+    """Measure token occurrences and guards with optional model-specific preprocessing."""
 
     total_examples = 0
     fully_covered_examples = 0
@@ -88,54 +97,82 @@ def evaluate_coverage(
     missing_pieces: Counter[str] = Counter()
     critical_missing: list[str] = []
     original_unk_count = 0
+    original_unk_count_on_compact_path = 0
+    compact_path_unk_count = 0
+    new_unk_count = 0
     fallback_examples = 0
     affected: list[dict[str, Any]] = []
     for path in data_paths:
         for record in stream_jsonl(path):
             total_examples += 1
-            source_ids = tokenizer.encode(record.source, add_special_tokens=True)
-            source_tokens += len(source_ids)
-            original_unk_count += sum(token_id == tokenizer.unk_token_id for token_id in source_ids)
-            source_decision = guard_original_ids(
-                source_ids, mapping, tokenizer, profile_id, fallback_policy
+            source_ids = (
+                encode_text(record.source)
+                if encode_text is not None
+                else tokenizer.encode(record.source, add_special_tokens=True)
             )
+            source_tokens += len(source_ids)
+            source_decision = guard_original_ids(
+                source_ids, mapping, tokenizer, profile_id, fallback_policy,
+                record_missing_pieces=record_missing_pieces,
+            )
+            source_missing = set(source_decision.missing_original_ids)
             source_missing_occurrences = [
-                token_id
-                for token_id in source_ids
-                if token_id in source_decision.missing_original_ids
+                token_id for token_id in source_ids if token_id in source_missing
             ]
             covered_source_tokens += len(source_ids) - len(source_missing_occurrences)
-            decisions = [source_decision]
+            sequences = [(source_decision, source_missing_occurrences, record.source_language)]
             if record.target is not None:
-                target_ids = tokenizer.encode(record.target, add_special_tokens=True)
+                target_ids = (
+                    encode_text(record.target)
+                    if encode_text is not None
+                    else tokenizer.encode(record.target, add_special_tokens=True)
+                )
                 target_tokens += len(target_ids)
-                original_unk_count += sum(
-                    token_id == tokenizer.unk_token_id for token_id in target_ids
-                )
                 target_decision = guard_original_ids(
-                    target_ids, mapping, tokenizer, profile_id, fallback_policy
+                    target_ids, mapping, tokenizer, profile_id, fallback_policy,
+                    record_missing_pieces=record_missing_pieces,
                 )
+                target_missing = set(target_decision.missing_original_ids)
                 target_missing_occurrences = [
-                    token_id
-                    for token_id in target_ids
-                    if token_id in target_decision.missing_original_ids
+                    token_id for token_id in target_ids if token_id in target_missing
                 ]
                 covered_target_tokens += len(target_ids) - len(target_missing_occurrences)
-                decisions.append(target_decision)
-            missing = [
-                token_id for decision in decisions for token_id in decision.missing_original_ids
-            ]
+                sequences.append(
+                    (target_decision, target_missing_occurrences, record.target_language)
+                )
+            missing: list[int] = []
+            for decision, missing_occurrences, language in sequences:
+                sequence_unk_count = sum(
+                    token_id == tokenizer.unk_token_id for token_id in decision.original_ids
+                )
+                original_unk_count += sequence_unk_count
+                if decision.compact_ids is not None:
+                    roundtrip_ids = mapping.map_compact_ids(decision.compact_ids)
+                    roundtrip_unk_count = sum(
+                        token_id == tokenizer.unk_token_id for token_id in roundtrip_ids
+                    )
+                    original_unk_count_on_compact_path += sequence_unk_count
+                    compact_path_unk_count += roundtrip_unk_count
+                    new_unk_count += max(0, roundtrip_unk_count - sequence_unk_count)
+                missing.extend(missing_occurrences)
+                if not missing_occurrences:
+                    continue
+                missing_counts.update(missing_occurrences)
+                missing_by_language.setdefault(language or "unknown", Counter()).update(
+                    missing_occurrences
+                )
+                missing_by_domain.setdefault(record.domain or "unknown", Counter()).update(
+                    missing_occurrences
+                )
+                if record_missing_pieces:
+                    for token_id, count in Counter(missing_occurrences).items():
+                        converted = tokenizer.convert_ids_to_tokens(token_id)
+                        piece = converted if isinstance(converted, str) else str(converted)
+                        missing_pieces[piece] += count
             if not missing:
                 fully_covered_examples += 1
                 continue
             fallback_examples += 1
-            missing_counts.update(missing)
-            for decision in decisions:
-                missing_pieces.update(decision.missing_pieces)
-            language = record.source_language or "unknown"
-            domain = record.domain or "unknown"
-            missing_by_language.setdefault(language, Counter()).update(missing)
-            missing_by_domain.setdefault(domain, Counter()).update(missing)
             if record.critical:
                 critical_missing.append(record.id)
             affected.append(
@@ -163,8 +200,9 @@ def evaluate_coverage(
         },
         missing_critical_examples=critical_missing,
         original_unk_count=original_unk_count,
-        compact_path_unk_count=original_unk_count,
-        new_unk_count=0,
+        original_unk_count_on_compact_path=original_unk_count_on_compact_path,
+        compact_path_unk_count=compact_path_unk_count,
+        new_unk_count=new_unk_count,
         fallback_examples=fallback_examples,
         affected_examples_by_length=affected,
         most_common_missing_pieces=missing_pieces.most_common(20),

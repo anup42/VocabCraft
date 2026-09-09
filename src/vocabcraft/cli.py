@@ -13,7 +13,7 @@ import typer
 from vocabcraft import __version__
 from vocabcraft.config import load_config
 from vocabcraft.exceptions import VocabCraftError
-from vocabcraft.inspection import inspect_mt5_to_directory
+from vocabcraft.inspection import inspect_model_to_directory
 from vocabcraft.logging import configure_logging
 from vocabcraft.workflows import (
     ExecutionMode,
@@ -101,10 +101,12 @@ def inspect_model_command(
     output: Annotated[Path, typer.Option(help="New output directory for inspection reports.")],
     revision: Annotated[str | None, typer.Option(help="Optional exact model revision.")] = None,
 ) -> None:
-    """Inspect actual mT5 tensors, IDs, storage ties, and tokenizer metadata."""
+    """Inspect supported model tensors, IDs, storage ties, and tokenizer metadata."""
 
     result = _run(
-        lambda: inspect_mt5_to_directory(model, output, revision=revision, trust_remote_code=False)
+        lambda: inspect_model_to_directory(
+            model, output, revision=revision, trust_remote_code=False
+        )
     )
     _print_result(output, result)
 
@@ -218,7 +220,7 @@ def reconstruct_full_command(
     ],
     output: Annotated[Path, typer.Option(help="New reconstructed artifact directory.")],
 ) -> None:
-    """Reconstruct and reload the original-vocabulary mT5 tensors offline."""
+    """Reconstruct and reload the original-vocabulary model tensors offline."""
 
     result = _run(lambda: reconstruct_full_to_directory(compact, pack, output))
     _print_result(output, result)

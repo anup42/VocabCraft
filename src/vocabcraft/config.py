@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -24,7 +25,7 @@ def _string_list(value: object, name: str) -> list[str]:
 
 
 def _int_list(value: object, name: str) -> list[int]:
-    if not isinstance(value, list) or not all(isinstance(item, int) for item in value):
+    if not isinstance(value, list) or not all(type(item) is int for item in value):
         raise ConfigurationError(f"{name} must be a list of integers")
     return cast(list[int], value)
 
@@ -108,7 +109,7 @@ class ValidationConfig:
 
 @dataclass(frozen=True)
 class RuntimeConfig:
-    """Execution device and batching configuration."""
+    """Supported CPU/FP32 execution and encoder validation batch size."""
 
     dtype: str = "auto"
     device: str = "cpu"
@@ -168,6 +169,18 @@ def load_config(path: str | Path) -> VocabCraftConfig:
     validation_raw = _mapping(raw.get("validation", {}), "validation")
     runtime_raw = _mapping(raw.get("runtime", {}), "runtime")
     external_raw_object = raw.get("external_evaluation")
+    for section_name, owner, schema in (
+        ("model", model_raw, ModelConfig),
+        ("profile", profile_raw, ProfileConfig),
+        ("fallback", fallback_raw, FallbackConfig),
+        ("validation", validation_raw, ValidationConfig),
+    ):
+        for name, descriptor in schema.__dataclass_fields__.items():
+            if descriptor.type == "bool" and name in owner and type(owner[name]) is not bool:
+                raise ConfigurationError(f"{section_name}.{name} must be a YAML boolean")
+    for name in ("maximum_new_unk_count", "maximum_missing_critical_examples"):
+        if name in validation_raw and type(validation_raw[name]) is not int:
+            raise ConfigurationError(f"validation.{name} must be an integer")
 
     model_id = model_raw.get("id")
     profile_id = profile_raw.get("id")
@@ -189,11 +202,18 @@ def load_config(path: str | Path) -> VocabCraftConfig:
         raise ConfigurationError(f"IDs cannot be both manually kept and removed: {overlap}")
 
     batch_size = runtime_raw.get("batch_size", 4)
-    if not isinstance(batch_size, int) or batch_size < 1:
+    if type(batch_size) is not int or batch_size < 1:
         raise ConfigurationError("runtime.batch_size must be a positive integer")
     device = runtime_raw.get("device", "cpu")
     if not isinstance(device, str) or not device:
         raise ConfigurationError("runtime.device must be a non-empty string")
+    if device != "cpu":
+        raise ConfigurationError("runtime.device currently supports only cpu")
+    dtype = runtime_raw.get("dtype", "auto")
+    if not isinstance(dtype, str) or dtype not in {"auto", "float32", "fp32"}:
+        raise ConfigurationError("runtime.dtype currently supports only auto/float32/fp32")
+    if fallback_raw.get("fail_closed_when_unavailable", True) is not True:
+        raise ConfigurationError("fallback.fail_closed_when_unavailable must remain true")
     revision = model_raw.get("revision")
     if revision is not None and not isinstance(revision, str):
         raise ConfigurationError("model.revision must be null or a string")
@@ -217,7 +237,12 @@ def load_config(path: str | Path) -> VocabCraftConfig:
             raise ConfigurationError("external_evaluation.non_inferiority.metric is required")
         if not isinstance(timeout, int) or timeout < 1:
             raise ConfigurationError("external_evaluation.timeout_seconds must be positive")
-        if not isinstance(maximum_drop, (int, float)) or maximum_drop < 0:
+        if (
+            isinstance(maximum_drop, bool)
+            or not isinstance(maximum_drop, (int, float))
+            or not math.isfinite(maximum_drop)
+            or maximum_drop < 0
+        ):
             raise ConfigurationError(
                 "external_evaluation.non_inferiority.maximum_allowed_drop must be non-negative"
             )
@@ -318,7 +343,7 @@ def load_config(path: str | Path) -> VocabCraftConfig:
             ),
         ),
         runtime=RuntimeConfig(
-            dtype=str(runtime_raw.get("dtype", "auto")),
+            dtype=str(dtype),
             device=device,
             batch_size=batch_size,
         ),
@@ -327,12 +352,18 @@ def load_config(path: str | Path) -> VocabCraftConfig:
     )
     if config.project.name != "VocabCraft":
         raise ConfigurationError("project.name must be VocabCraft")
-    if (
-        config.validation.encoder_max_absolute_difference < 0
-        or config.validation.encoder_mean_absolute_difference < 0
-        or config.validation.teacher_forcing_max_absolute_difference < 0
-    ):
+    differences = (
+        config.validation.encoder_max_absolute_difference,
+        config.validation.encoder_mean_absolute_difference,
+        config.validation.teacher_forcing_max_absolute_difference,
+    )
+    if any(not math.isfinite(value) or value < 0 for value in differences):
         raise ConfigurationError("validation difference tolerances must be non-negative")
+    if (
+        config.validation.maximum_new_unk_count < 0
+        or config.validation.maximum_missing_critical_examples < 0
+    ):
+        raise ConfigurationError("validation count thresholds must be non-negative")
     if not -1.0 <= config.validation.minimum_encoder_cosine_similarity <= 1.0:
         raise ConfigurationError(
             "validation.minimum_encoder_cosine_similarity must be between -1 and 1"

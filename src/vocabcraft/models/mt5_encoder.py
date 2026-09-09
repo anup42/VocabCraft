@@ -12,6 +12,7 @@ from vocabcraft.exceptions import ArtifactError
 from vocabcraft.fallback import FallbackPolicyName, ProfiledTokenizer
 from vocabcraft.mappings import IdMapping
 from vocabcraft.tokenizers.base import OriginalTokenizer
+from vocabcraft.tokenizers.fingerprint import tokenizer_behavior_hash
 
 
 class CompactMT5Encoder:
@@ -53,6 +54,17 @@ class CompactMT5Encoder:
             OriginalTokenizer,
             AutoTokenizer.from_pretrained(root / "tokenizer", use_fast=False),
         )
+        if (
+            model.config.vocab_size != len(mapping.new_to_old)
+            or metadata.get("compact_vocabulary_size") != len(mapping.new_to_old)
+            or metadata.get("original_model_vocabulary_size") != mapping.original_vocab_size
+        ):
+            raise ArtifactError("encoder model, metadata and mapping dimensions disagree")
+        expected_behavior = metadata.get("tokenizer_behavior_sha256")
+        if expected_behavior and tokenizer_behavior_hash(tokenizer) != expected_behavior:
+            raise ArtifactError("saved tokenizer behavior differs from the source")
+        if set(tokenizer.all_special_ids).difference(mapping.old_to_new):
+            raise ArtifactError("encoder mapping omits required special tokens")
         profiled = ProfiledTokenizer(
             tokenizer,
             mapping,

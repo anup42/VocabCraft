@@ -69,6 +69,8 @@ module = [
   "vocabcraft.models.mt5_encoder",
   "vocabcraft.models.mt5_guarded_generation",
   "vocabcraft.models.mt5_seq2seq",
+  "vocabcraft.models.xlm_roberta",
+  "vocabcraft.models.registry",
   "vocabcraft.packs",
   "vocabcraft.workflows",
 ]
@@ -77,4 +79,4 @@ disable_error_code = ["no-untyped-call"]
 [tool.pytest.ini_options]
 addopts = "-ra"
 testpaths = ["tests"]
-markers = ["integration: downloads and exercises a real model"]
+markers = ["integration: explicitly enabled tests using real model checkpoints"]

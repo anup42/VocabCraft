@@ -43,7 +43,15 @@ def benchmark_encoder_forward(
         raise ValueError("iterations must be positive and warmups non-negative")
     model.eval()
     process = psutil.Process()
-    encoder = model.get_encoder() if callable(getattr(model, "get_encoder", None)) else model
+    encoder = (
+        model.get_encoder()
+        if (
+            getattr(model.config, "is_encoder_decoder", False)
+            or getattr(model.config, "model_type", None) == "mt5"
+        )
+        and callable(getattr(model, "get_encoder", None))
+        else model
+    )
     with torch.no_grad():
         for _ in range(warmups):
             encoder(input_ids=input_ids, attention_mask=attention_mask)

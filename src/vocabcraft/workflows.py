@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import copy
+import math
 import time
 from collections.abc import Sequence
+from itertools import islice
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any, Literal, cast
@@ -27,18 +29,24 @@ from vocabcraft.evaluation.external_hook import run_external_evaluation
 from vocabcraft.evaluation.generation import compare_greedy_generation
 from vocabcraft.evaluation.non_inferiority import paired_bootstrap_non_inferiority
 from vocabcraft.evaluation.teacher_forcing import compare_teacher_forcing
-from vocabcraft.exceptions import ArtifactError, ValidationFailure
+from vocabcraft.evaluation.validation_gates import aggregate_validation_gates
+from vocabcraft.exceptions import ArtifactError, ConfigurationError, ValidationFailure
 from vocabcraft.fallback import guard_original_ids
-from vocabcraft.hashing import sha256_file
+from vocabcraft.hashing import sha256_file, sha256_json
 from vocabcraft.inventory import build_inventory
 from vocabcraft.manifests import write_selection_artifacts
 from vocabcraft.mappings import IdMapping
-from vocabcraft.models.mt5 import MT5Adapter
 from vocabcraft.models.mt5_guarded_generation import (
     GuardedMT5Generator,
     load_guarded_mt5_model,
 )
 from vocabcraft.models.mt5_seq2seq import load_compact_mt5_seq2seq_model
+from vocabcraft.models.registry import (
+    SupportedAdapter,
+    artifact_family,
+    load_adapter,
+    load_encoder_model,
+)
 from vocabcraft.packs import (
     build_cold_pack,
     merge_packs,
@@ -55,11 +63,31 @@ from vocabcraft.selection import (
     observe_critical_terms,
     select_profile,
 )
+from vocabcraft.tokenizers.fingerprint import tokenizer_behavior_hash
 
 ExecutionMode = Literal["encoder_exact", "seq2seq_compact", "seq2seq_guarded"]
 
 
-def _selection(adapter: MT5Adapter, config: VocabCraftConfig) -> tuple[SelectionResult, IdMapping]:
+def _configured_adapter(identifier: str, config: VocabCraftConfig) -> SupportedAdapter:
+    adapter = load_adapter(
+        identifier,
+        revision=config.model.revision,
+        trust_remote_code=config.model.trust_remote_code,
+    )
+    if config.runtime.dtype in {"float32", "fp32"} and any(
+        parameter.is_floating_point() and parameter.dtype != torch.float32
+        for parameter in adapter.model.parameters()
+    ):
+        raise ConfigurationError(
+            "runtime.dtype requests float32 but source weights have another dtype; "
+            "use auto to preserve the checkpoint dtype (compaction does not cast weights)"
+        )
+    return adapter
+
+
+def _selection(
+    adapter: SupportedAdapter, config: VocabCraftConfig
+) -> tuple[SelectionResult, IdMapping]:
     records = build_inventory(adapter.tokenizer)
     observe_calibration(records, adapter.tokenizer, config.profile.calibration_files)
     observe_critical_terms(records, adapter.tokenizer, config.profile.critical_terms_files)
@@ -68,7 +96,7 @@ def _selection(adapter: MT5Adapter, config: VocabCraftConfig) -> tuple[Selection
         adapter.tokenizer,
         config.profile,
         adapter.model.config,
-        adapter.model.generation_config,
+        getattr(adapter.model, "generation_config", None),
     )
     mapping = IdMapping.from_retained(list(selection.retained_ids), adapter.model_vocab_size)
     return selection, mapping
@@ -79,11 +107,7 @@ def analyze_vocab_to_directory(
 ) -> dict[str, Any]:
     """Inspect tokenizer inventory, select a profile, and write deterministic manifests."""
 
-    adapter = MT5Adapter.from_pretrained(
-        model_identifier,
-        revision=config.model.revision,
-        trust_remote_code=config.model.trust_remote_code,
-    )
+    adapter = _configured_adapter(model_identifier, config)
     selection, mapping = _selection(adapter, config)
     summary = {
         "profile_id": config.profile.id,
@@ -95,6 +119,8 @@ def analyze_vocab_to_directory(
         "excluded_model_rows": adapter.model_vocab_size - len(selection.retained_ids),
         "model_state_sha256": adapter.model_state_hash(),
         "tokenizer_sha256": adapter.tokenizer_hash(),
+        "tokenizer_behavior_sha256": tokenizer_behavior_hash(adapter.tokenizer),
+        "model_family": adapter.model.config.model_type,
     }
     with atomic_output_directory(output) as staging:
         write_selection_artifacts(staging, selection, config.profile.id)
@@ -120,13 +146,9 @@ def build_profile_to_directory(
     mode: ExecutionMode,
     output: str | Path,
 ) -> dict[str, Any]:
-    """Build a selected compact mT5 profile in the requested explicitly labeled mode."""
+    """Build a selected compact profile using its inspected model architecture."""
 
-    adapter = MT5Adapter.from_pretrained(
-        model_identifier,
-        revision=config.model.revision,
-        trust_remote_code=config.model.trust_remote_code,
-    )
+    adapter = _configured_adapter(model_identifier, config)
     selection, mapping = _selection(adapter, config)
     if mode == "encoder_exact":
         return adapter.build_encoder_profile(
@@ -146,14 +168,99 @@ def _load_artifact_mapping(root: Path) -> tuple[dict[str, Any], IdMapping]:
     mapping_object = read_json(root / "mapping-report.json")
     if not isinstance(metadata_object, dict) or not isinstance(mapping_object, dict):
         raise ArtifactError("artifact metadata and mapping reports must be JSON objects")
-    return metadata_object, IdMapping.from_dict(mapping_object)
+    mapping = IdMapping.from_dict(mapping_object)
+    if metadata_object.get("compact_vocabulary_size") != len(mapping.new_to_old):
+        raise ArtifactError("metadata vocabulary size differs from ID mapping")
+    if metadata_object.get("original_model_vocabulary_size") != mapping.original_vocab_size:
+        raise ArtifactError("metadata original vocabulary size differs from ID mapping")
+    return metadata_object, mapping
 
 
-def _validate_source_hashes(adapter: MT5Adapter, metadata: dict[str, Any]) -> None:
+def _validate_source_hashes(adapter: SupportedAdapter, metadata: dict[str, Any]) -> None:
+    if adapter.model.config.model_type != artifact_family(metadata):
+        raise ValidationFailure("original model family differs from compact artifact")
     if adapter.tokenizer_hash() != metadata.get("tokenizer_sha256"):
         raise ValidationFailure("original tokenizer hash differs from compact artifact")
     if adapter.model_state_hash() != metadata.get("model_state_sha256"):
         raise ValidationFailure("original model state hash differs from compact artifact")
+    expected_behavior = metadata.get("tokenizer_behavior_sha256")
+    if expected_behavior and tokenizer_behavior_hash(adapter.tokenizer) != expected_behavior:
+        raise ValidationFailure("original tokenizer behavior differs from compact artifact")
+    if metadata.get("model_family") == "xlm-roberta" and (
+        sha256_json(getattr(adapter, "sentence_embedding_config", None))
+        != metadata.get("sentence_embedding_sha256")
+    ):
+        raise ValidationFailure("original sentence embedding configuration differs from artifact")
+
+
+def _source_ids(adapter: SupportedAdapter, text: str) -> list[int]:
+    tokenize = getattr(adapter, "tokenize_text", None)
+    if callable(tokenize):
+        return cast(list[int], tokenize(text))
+    return cast(list[int], adapter.tokenizer.encode(text, add_special_tokens=True))
+
+
+def _encoder_validation(
+    adapter: SupportedAdapter,
+    compact_model: Any,
+    mapping: IdMapping,
+    config: VocabCraftConfig,
+    data_path: str | Path,
+) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    records = iter(stream_jsonl(data_path))
+    while group := list(islice(records, config.runtime.batch_size)):
+        rows: list[list[int]] = []
+        supported_items: list[dict[str, Any]] = []
+        for record in group:
+            source_ids = _source_ids(adapter, record.source)
+            decision = guard_original_ids(
+                source_ids,
+                mapping,
+                adapter.tokenizer,
+                config.profile.id,
+                config.fallback.policy,
+                record_missing_pieces=config.fallback.record_missing_pieces,
+            )
+            item: dict[str, Any] = {
+                "id": record.id,
+                "metadata": record.metadata,
+                "guard": decision.to_dict(),
+                "comparison": None,
+            }
+            results.append(item)
+            if decision.compact_ids is not None:
+                rows.append(source_ids)
+                supported_items.append(item)
+        if not rows:
+            continue
+        pad_id = adapter.tokenizer.pad_token_id
+        if not isinstance(pad_id, int):
+            raise ValidationFailure("encoder batching requires an original padding token")
+        width = max(map(len, rows))
+        padding_left = getattr(adapter.tokenizer, "padding_side", "right") == "left"
+        padded = []
+        masks = []
+        for row in rows:
+            padding = [pad_id] * (width - len(row))
+            mask_padding = [0] * len(padding)
+            padded.append(padding + row if padding_left else row + padding)
+            masks.append(
+                mask_padding + [1] * len(row) if padding_left else [1] * len(row) + mask_padding
+            )
+        comparison = compare_encoder_models(
+            adapter.model,
+            compact_model,
+            torch.tensor(padded, dtype=torch.long),
+            torch.tensor(masks, dtype=torch.long),
+            mapping,
+            config.validation,
+            include_hidden_states=True,
+            include_sentence_embeddings=bool(getattr(adapter, "sentence_embedding_config", None)),
+        )
+        for item, row_comparison in zip(supported_items, comparison["per_example"], strict=True):
+            item["comparison"] = row_comparison
+    return results
 
 
 def validate_to_directory(
@@ -167,11 +274,7 @@ def validate_to_directory(
 
     root = Path(compact_artifact)
     metadata, mapping = _load_artifact_mapping(root)
-    adapter = MT5Adapter.from_pretrained(
-        original_identifier,
-        revision=config.model.revision,
-        trust_remote_code=config.model.trust_remote_code,
-    )
+    adapter = _configured_adapter(original_identifier, config)
     _validate_source_hashes(adapter, metadata)
     coverage = evaluate_coverage(
         adapter.tokenizer,
@@ -179,40 +282,16 @@ def validate_to_directory(
         [data_path],
         profile_id=config.profile.id,
         fallback_policy=config.fallback.policy,
+        encode_text=lambda text: _source_ids(adapter, text),
+        record_missing_pieces=config.fallback.record_missing_pieces,
     )
     mode = metadata.get("vocabcraft_mode")
     encoder_results: list[dict[str, Any]] = []
     teacher_results: list[dict[str, Any]] = []
     generation_results: list[dict[str, Any]] = []
     if mode == "encoder_exact":
-        compact_model = MT5EncoderModel.from_pretrained(root / "model").eval()
-        for record in stream_jsonl(data_path):
-            source_ids = adapter.tokenizer.encode(record.source, add_special_tokens=True)
-            decision = guard_original_ids(
-                source_ids,
-                mapping,
-                adapter.tokenizer,
-                config.profile.id,
-                config.fallback.policy,
-            )
-            if decision.compact_ids is None:
-                encoder_results.append(
-                    {"id": record.id, "guard": decision.to_dict(), "comparison": None}
-                )
-                continue
-            original_ids = torch.tensor([source_ids], dtype=torch.long)
-            comparison = compare_encoder_models(
-                adapter.model,
-                compact_model,
-                original_ids,
-                torch.ones_like(original_ids),
-                mapping,
-                config.validation,
-                include_hidden_states=True,
-            )
-            encoder_results.append(
-                {"id": record.id, "metadata": record.metadata, "comparison": comparison}
-            )
+        compact_model = load_encoder_model(root, metadata)
+        encoder_results = _encoder_validation(adapter, compact_model, mapping, config, data_path)
     elif mode == "seq2seq_compact":
         compact_seq2seq = load_compact_mt5_seq2seq_model(root / "model")
         for record in stream_jsonl(data_path):
@@ -223,6 +302,7 @@ def validate_to_directory(
                 adapter.tokenizer,
                 config.profile.id,
                 config.fallback.policy,
+                record_missing_pieces=config.fallback.record_missing_pieces,
             )
             if source_decision.compact_ids is None:
                 generation_results.append(
@@ -251,6 +331,7 @@ def validate_to_directory(
                     adapter.tokenizer,
                     config.profile.id,
                     config.fallback.policy,
+                    record_missing_pieces=config.fallback.record_missing_pieces,
                 )
                 if target_decision.compact_ids is None:
                     teacher_results.append(
@@ -315,20 +396,17 @@ def validate_to_directory(
             )
     else:
         raise ArtifactError(f"unsupported VocabCraft artifact mode: {mode!r}")
-    encoder_pass = all(
-        item["comparison"] is None or bool(item["comparison"]["passed"]) for item in encoder_results
+    gates = aggregate_validation_gates(
+        str(mode),
+        config.validation,
+        total_examples=coverage.total_examples,
+        missing_critical_examples=coverage.missing_critical_examples,
+        new_unk_count=coverage.new_unk_count,
+        encoder_results=encoder_results,
+        teacher_results=teacher_results,
+        generation_results=generation_results,
     )
-    strict_failures = {
-        "missing_critical_examples": coverage.missing_critical_examples,
-        "new_unk_count": coverage.new_unk_count,
-        "encoder_equivalence_failed": not encoder_pass,
-    }
-    passed = (
-        len(coverage.missing_critical_examples)
-        <= config.validation.maximum_missing_critical_examples
-        and coverage.new_unk_count <= config.validation.maximum_new_unk_count
-        and encoder_pass
-    )
+    passed = gates.passed
     external_result: dict[str, Any] | None = None
     if config.external_evaluation is not None:
         external = config.external_evaluation
@@ -351,12 +429,30 @@ def validate_to_directory(
         metric_name = external.non_inferiority.metric
         original_metric = original_metrics.get(metric_name)
         compact_metric = compact_metrics.get(metric_name)
-        if not isinstance(original_metric, (int, float)) or not isinstance(
-            compact_metric, (int, float)
+        if any(
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            for value in (original_metric, compact_metric)
         ):
             raise ValidationFailure(f"external metrics are missing numeric {metric_name!r}")
+        original_metric = cast(float, original_metric)
+        compact_metric = cast(float, compact_metric)
         original_scores = original_metrics.get("per_example_scores")
         compact_scores = compact_metrics.get("per_example_scores")
+        if (original_scores is not None or compact_scores is not None) and (
+            not isinstance(original_scores, list)
+            or not isinstance(compact_scores, list)
+            or not original_scores
+            or len(original_scores) != len(compact_scores)
+            or not all(
+                not isinstance(value, bool)
+                and isinstance(value, (int, float))
+                and math.isfinite(value)
+                for value in original_scores + compact_scores
+            )
+        ):
+            raise ValidationFailure("external per-example scores must be finite, paired lists")
         statistical_result: dict[str, Any] | None = None
         aggregate_passed = (
             float(original_metric) - float(compact_metric)
@@ -365,8 +461,12 @@ def validate_to_directory(
         if (
             isinstance(original_scores, list)
             and isinstance(compact_scores, list)
-            and all(isinstance(value, (int, float)) for value in original_scores)
-            and all(isinstance(value, (int, float)) for value in compact_scores)
+            and all(
+                not isinstance(value, bool)
+                and isinstance(value, (int, float))
+                and math.isfinite(value)
+                for value in original_scores + compact_scores
+            )
         ):
             statistical_result = paired_bootstrap_non_inferiority(
                 [float(value) for value in original_scores],
@@ -400,13 +500,16 @@ def validate_to_directory(
         )
     validation = {
         "mode": mode,
+        "model_family": artifact_family(metadata),
         "passed": passed,
         "coverage": coverage.to_dict(),
         "encoder_equivalence": encoder_results,
         "teacher_forcing": teacher_results,
         "generation": generation_results,
         "external_evaluation": external_result,
-        "strict_failures": strict_failures,
+        "strict_failures": gates.strict_failures,
+        "comparison_counts": gates.comparison_counts,
+        "encoder_batch_size": config.runtime.batch_size,
     }
     with atomic_output_directory(output) as staging:
         write_json_markdown_report(
@@ -432,15 +535,17 @@ def validate_to_directory(
     return validation
 
 
-def _vocabulary_parameter_count(model: Any, *vocabulary_sizes: int) -> int:
+def _vocabulary_parameter_count(model: Any, vocabulary_tensor_names: Sequence[str]) -> int:
     storages: dict[int, torch.Tensor] = {}
-    for parameter in model.parameters():
-        if any(size in vocabulary_sizes for size in parameter.shape):
+    for name, parameter in model.named_parameters(remove_duplicate=False):
+        if name in vocabulary_tensor_names:
             storages[parameter.untyped_storage().data_ptr()] = parameter
     return sum(value.numel() for value in storages.values())
 
 
-def _source_encoder_model(adapter: MT5Adapter) -> MT5EncoderModel:
+def _source_encoder_model(adapter: SupportedAdapter) -> Any:
+    if adapter.model.config.model_type == "xlm-roberta":
+        return adapter.model
     model = MT5EncoderModel(copy.deepcopy(adapter.model.config))
     source_state = adapter.model.state_dict()
     model.load_state_dict(
@@ -462,13 +567,13 @@ def benchmark_to_directory(
     root = Path(compact_artifact)
     metadata, mapping = _load_artifact_mapping(root)
     start = time.perf_counter()
-    adapter = MT5Adapter.from_pretrained(original_identifier)
+    adapter = load_adapter(original_identifier, revision=metadata.get("source_revision"))
     original_load_seconds = time.perf_counter() - start
     _validate_source_hashes(adapter, metadata)
     mode = metadata.get("vocabcraft_mode")
     start = time.perf_counter()
     if mode == "encoder_exact":
-        compact_model: Any = MT5EncoderModel.from_pretrained(root / "model").eval()
+        compact_model: Any = load_encoder_model(root, metadata)
     elif mode == "seq2seq_compact":
         compact_model = load_compact_mt5_seq2seq_model(root / "model")
     elif mode == "seq2seq_guarded":
@@ -488,7 +593,7 @@ def benchmark_to_directory(
     tokenization_times: list[float] = []
     for record in stream_jsonl(data_path):
         start = time.perf_counter()
-        source_ids = adapter.tokenizer.encode(record.source, add_special_tokens=True)
+        source_ids = _source_ids(adapter, record.source)
         tokenization_times.append((time.perf_counter() - start) * 1000.0)
         if all(token_id in mapping.old_to_new for token_id in source_ids):
             all_rows.append(source_ids)
@@ -511,16 +616,16 @@ def benchmark_to_directory(
         [data_path],
         profile_id=str(metadata.get("profile_id", "unknown")),
         fallback_policy="full_model",
+        encode_text=lambda text: _source_ids(adapter, text),
     )
     original_vocab = adapter.model_vocab_size
     compact_vocab = len(mapping.new_to_old)
-    embedding_dimension = adapter.model.shared.weight.shape[1]
+    embedding_dimension = adapter.model.get_input_embeddings().weight.shape[1]
+    vocabulary_names = [str(item["name"]) for item in adapter.list_vocabulary_tensors()]
     original_vocabulary_parameters = _vocabulary_parameter_count(
-        original_benchmark_model, original_vocab
+        original_benchmark_model, vocabulary_names
     )
-    compact_vocabulary_parameters = _vocabulary_parameter_count(
-        compact_model, compact_vocab, original_vocab
-    )
+    compact_vocabulary_parameters = _vocabulary_parameter_count(compact_model, vocabulary_names)
     original_total_parameters = sum(
         parameter.numel() for parameter in original_benchmark_model.parameters()
     )
@@ -577,7 +682,7 @@ def build_pack_to_directory(
 
     root = Path(compact_artifact)
     metadata, mapping = _load_artifact_mapping(root)
-    adapter = MT5Adapter.from_pretrained(model_identifier)
+    adapter = load_adapter(model_identifier, revision=metadata.get("source_revision"))
     _validate_source_hashes(adapter, metadata)
     excluded = sorted(set(range(mapping.original_vocab_size)) - set(mapping.new_to_old))
     mode = metadata.get("vocabcraft_mode")
@@ -597,6 +702,11 @@ def build_pack_to_directory(
         tokenizer_hash=adapter.tokenizer_hash(),
         source_revision=getattr(adapter.model.config, "_commit_hash", None),
         profile_id=str(metadata.get("profile_id", "unknown")),
+        vocabulary_tensor_names=[
+            str(item["name"])
+            for item in adapter.list_vocabulary_tensors()
+            if item["name"] in vocabulary_state
+        ],
     )
 
 

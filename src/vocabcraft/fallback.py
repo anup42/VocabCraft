@@ -47,13 +47,15 @@ def guard_original_ids(
     tokenizer: OriginalTokenizer,
     profile_id: str,
     fallback_policy: FallbackPolicyName,
+    *,
+    record_missing_pieces: bool = True,
 ) -> GuardDecision:
     """Map a fully covered sequence or require explicit fallback."""
 
     missing = sorted({token_id for token_id in original_ids if token_id not in mapping.old_to_new})
     if missing:
         pieces: list[str] = []
-        for token_id in missing:
+        for token_id in missing if record_missing_pieces else []:
             converted = tokenizer.convert_ids_to_tokens(token_id)
             pieces.append(converted if isinstance(converted, str) else str(converted))
         return GuardDecision(
@@ -89,11 +91,14 @@ class ProfiledTokenizer:
         mapping: IdMapping,
         profile_id: str,
         fallback_policy: FallbackPolicyName,
+        *,
+        record_missing_pieces: bool = True,
     ) -> None:
         self.original_tokenizer = tokenizer
         self.mapping = mapping
         self.profile_id = profile_id
         self.fallback_policy = fallback_policy
+        self.record_missing_pieces = record_missing_pieces
 
     def encode(self, text: str, *, add_special_tokens: bool = True) -> GuardDecision:
         """Tokenize to original IDs, check coverage, then optionally map."""
@@ -105,6 +110,7 @@ class ProfiledTokenizer:
             self.original_tokenizer,
             self.profile_id,
             self.fallback_policy,
+            record_missing_pieces=self.record_missing_pieces,
         )
 
     def guard_batch(self, original_ids: list[list[int]]) -> list[GuardDecision]:
@@ -117,6 +123,7 @@ class ProfiledTokenizer:
                 self.original_tokenizer,
                 self.profile_id,
                 self.fallback_policy,
+                record_missing_pieces=self.record_missing_pieces,
             )
             for row in original_ids
         ]

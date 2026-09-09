@@ -26,6 +26,7 @@ from vocabcraft.hashing import sha256_bytes, sha256_file, sha256_json
 from vocabcraft.mappings import IdMapping, remap_token_id_fields
 from vocabcraft.models.base import ModelAdapter
 from vocabcraft.selection import SelectionResult
+from vocabcraft.tokenizers.fingerprint import tokenizer_behavior_hash
 
 _GENERATION_ID_FIELDS = (
     "pad_token_id",
@@ -314,6 +315,7 @@ class MT5Adapter(ModelAdapter):
         resolved_revision = getattr(self.model.config, "_commit_hash", None)
         sentencepiece_details = _sentencepiece_details(self.tokenizer)
         return {
+            "model_family": "mt5",
             "model_identifier": self.identifier,
             "resolved_revision": resolved_revision,
             "model_class": type(self.model).__name__,
@@ -345,6 +347,7 @@ class MT5Adapter(ModelAdapter):
             "estimated_state_bytes_by_dtype": dict(sorted(dtype_bytes.items())),
             "model_state_sha256": self.model_state_hash(),
             "tokenizer_sha256": self.tokenizer_hash(),
+            "tokenizer_behavior_sha256": tokenizer_behavior_hash(self.tokenizer),
             "tokenizer_model_vocab_size_mismatch": len(self.tokenizer) != self.model_vocab_size,
         }
 
@@ -444,11 +447,13 @@ class MT5Adapter(ModelAdapter):
             "format_version": 1,
             "product": "VocabCraft",
             "vocabcraft_mode": mode,
+            "model_family": "mt5",
             "profile_id": profile_id,
             "source_model": self.identifier,
             "source_revision": getattr(self.model.config, "_commit_hash", None),
             "model_state_sha256": self.model_state_hash(),
             "tokenizer_sha256": self.tokenizer_hash(),
+            "tokenizer_behavior_sha256": tokenizer_behavior_hash(self.tokenizer),
             "original_model_vocabulary_size": mapping.original_vocab_size,
             "original_tokenizer_vocabulary_size": len(self.tokenizer),
             "compact_vocabulary_size": len(mapping.new_to_old),

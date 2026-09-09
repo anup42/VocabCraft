@@ -22,6 +22,10 @@ class IdMapping:
     ) -> IdMapping:
         """Construct and validate a stable contiguous mapping."""
 
+        if type(original_vocab_size) is not int or original_vocab_size < 1:
+            raise ValidationFailure("original vocabulary size must be a positive integer")
+        if not retained_ids or any(type(value) is not int for value in retained_ids):
+            raise ValidationFailure("retained IDs must be a non-empty sequence of integers")
         ordered = tuple(sorted(retained_ids))
         if len(set(ordered)) != len(ordered):
             raise ValidationFailure("retained original IDs must be unique")
@@ -37,11 +41,21 @@ class IdMapping:
         """Load a mapping from its machine-readable representation."""
 
         try:
-            original_vocab_size = int(payload["original_vocab_size"])
-            new_to_old = tuple(int(value) for value in payload["new_to_old"])
+            original_vocab_size = payload["original_vocab_size"]
+            raw_ids = payload["new_to_old"]
+            if not isinstance(raw_ids, list) or any(type(value) is not int for value in raw_ids):
+                raise ValueError("new_to_old must be an integer list")
+            new_to_old = tuple(raw_ids)
         except (KeyError, TypeError, ValueError) as exc:
             raise MappingError(f"invalid mapping payload: {exc}") from exc
-        return cls.from_retained(new_to_old, original_vocab_size)
+        if new_to_old != tuple(sorted(new_to_old)):
+            raise MappingError("serialized new_to_old must retain its sorted original ID order")
+        mapping = cls.from_retained(new_to_old, original_vocab_size)
+        if "compact_vocab_size" in payload and payload["compact_vocab_size"] != len(new_to_old):
+            raise MappingError("serialized compact_vocab_size disagrees with mapping")
+        if "old_to_new" in payload and payload["old_to_new"] != mapping.to_dict()["old_to_new"]:
+            raise MappingError("serialized old_to_new disagrees with new_to_old")
+        return mapping
 
     def validate(self) -> None:
         """Enforce contiguity, range, and round-trip invariants."""
@@ -70,6 +84,8 @@ class IdMapping:
     def map_original_ids(self, original_ids: list[int]) -> list[int]:
         """Map only when every original ID exists; never coerce missing IDs."""
 
+        if any(type(value) is not int for value in original_ids):
+            raise MappingError("original token IDs must be integers")
         missing = [token_id for token_id in original_ids if token_id not in self.old_to_new]
         if missing:
             raise MissingTokenError(missing)
@@ -78,6 +94,8 @@ class IdMapping:
     def map_labels(self, labels: list[int], ignore_index: int = -100) -> list[int]:
         """Map labels while preserving the framework ignore value exactly."""
 
+        if type(ignore_index) is not int or any(type(value) is not int for value in labels):
+            raise MappingError("labels and ignore_index must be integers")
         tokens = [label for label in labels if label != ignore_index]
         missing = [token_id for token_id in tokens if token_id not in self.old_to_new]
         if missing:
@@ -89,6 +107,8 @@ class IdMapping:
     def map_compact_ids(self, compact_ids: list[int]) -> list[int]:
         """Map generated compact IDs back to original IDs for decoding."""
 
+        if any(type(value) is not int for value in compact_ids):
+            raise MappingError("compact token IDs must be integers")
         if any(token_id < 0 or token_id >= len(self.new_to_old) for token_id in compact_ids):
             raise MappingError("compact token ID is outside the compact vocabulary")
         return [self.new_to_old[token_id] for token_id in compact_ids]
